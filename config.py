@@ -1,6 +1,8 @@
 import os
 from dataclasses import dataclass, field
 from typing import List
+from dotenv import load_dotenv
+load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "123456789").split(",")))  # твои Telegram ID
