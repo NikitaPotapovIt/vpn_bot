@@ -20,8 +20,8 @@ class ServerConfig:
 
 SERVERS: List[ServerConfig] = [
     ServerConfig(
-        name="Server 1 (DE)",
-        host=os.getenv("POTAPOV_HOST", "1.2.3.4"),
+        name="POTAPOV_HOST",
+        host=os.getenv("POTAPOV_HOST", "REDACTED_HOST"),
         port=22,
         ssh_user="root",
         ssh_key_path=os.getenv("SSH_KEY_PATH", "/root/.ssh/id_rsa"),
@@ -29,8 +29,8 @@ SERVERS: List[ServerConfig] = [
         wg_config_path="/etc/wireguard/wg0.conf",
     ),
     ServerConfig(
-        name="Server 2 (NL)",
-        host=os.getenv("GHISLAIN_HOST", "5.6.7.8"),
+        name="GHISLAIN_HOST",
+        host=os.getenv("GHISLAIN_HOST", "REDACTED_HOST"),
         port=22,
         ssh_user="root",
         ssh_key_path=os.getenv("SSH_KEY_PATH", "/root/.ssh/id_rsa"),
@@ -38,8 +38,8 @@ SERVERS: List[ServerConfig] = [
         wg_config_path="/etc/wireguard/wg0.conf",
     ),
     ServerConfig(
-        name="Server 3 (FI)",
-        host=os.getenv("ALEV_HOST", "9.10.11.12"),
+        name="ALEV_HOST",
+        host=os.getenv("ALEV_HOST", "REDACTED_HOST"),
         port=22,
         ssh_user="root",
         ssh_key_path=os.getenv("SSH_KEY_PATH", "/root/.ssh/id_rsa"),
