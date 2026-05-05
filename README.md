@@ -19,9 +19,9 @@ pip install -r requirements.txt
 ```env
 TELEGRAM_TOKEN=1234567890:AABBCCddEEff...
 ADMIN_IDS=123456789,987654321          # твои Telegram ID через запятую
-SERVER1_HOST=1.2.3.4
-SERVER2_HOST=5.6.7.8
-SERVER3_HOST=9.10.11.12
+POTAPOV_HOST=1.2.3.4
+GHISLAIN_HOST=5.6.7.8
+ALEV_HOST=9.10.11.12
 SSH_KEY_PATH=/root/.ssh/id_rsa         # SSH-ключ для доступа к серверам
 ```
 
@@ -29,8 +29,8 @@ SSH_KEY_PATH=/root/.ssh/id_rsa         # SSH-ключ для доступа к �
 
 Убедись, что с сервера, где запущен бот, можно подключиться к остальным:
 ```bash
-ssh-copy-id -i /root/.ssh/id_rsa root@SERVER2_HOST
-ssh-copy-id -i /root/.ssh/id_rsa root@SERVER3_HOST
+ssh-copy-id -i /root/.ssh/id_rsa root@GHISLAIN_HOST
+ssh-copy-id -i /root/.ssh/id_rsa root@ALEV_HOST
 ```
 
 ### 3. WireGuard на серверах
