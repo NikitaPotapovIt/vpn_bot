@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "123456789").split(",")))  # твои Telegram ID
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "17070698").split(",")))  # твои Telegram ID
 
 # --- Серверы ---
 @dataclass
