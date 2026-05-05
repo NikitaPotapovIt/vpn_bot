@@ -2,6 +2,7 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 from config import TELEGRAM_TOKEN, ADMIN_IDS
 from database import init_db
@@ -21,7 +22,7 @@ async def main():
     logger.info("Database initialized")
     
     # Создание бота
-    bot = Bot(token=TELEGRAM_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     
     # Подключение роутеров
@@ -48,4 +49,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
