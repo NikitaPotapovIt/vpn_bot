@@ -1,7 +1,6 @@
 """Обработчики администратора: клиенты, серверы, ключи и оплаты"""
 
 import asyncio
-import io
 import calendar
 import logging
 import html
@@ -13,6 +12,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message,
     CallbackQuery,
+    BufferedInputFile,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
@@ -757,8 +757,7 @@ async def create_key_do(cb: CallbackQuery):
 
     file_name = f"vpn_client{client.id}_{server_name}_{datetime.now().strftime('%Y%m%d_%H%M')}.conf"
     vpn_uri = wg_data.get("vpn_uri", "")
-    admin_config = io.BytesIO(wg_data["config_text"].encode())
-    admin_config.name = file_name
+    admin_config = BufferedInputFile(wg_data["config_text"].encode(), filename=file_name)
     await cb.message.answer_document(
         admin_config,
         caption=(
@@ -782,8 +781,7 @@ async def create_key_do(cb: CallbackQuery):
     delivered_to_client = False
     delivered_vpn_to_client = False
     try:
-        client_config = io.BytesIO(wg_data["config_text"].encode())
-        client_config.name = file_name
+        client_config = BufferedInputFile(wg_data["config_text"].encode(), filename=file_name)
         sent_msg = await cb.bot.send_document(
             client.telegram_id,
             client_config,
@@ -1830,8 +1828,10 @@ async def add_confirm(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Главное меню:", reply_markup=admin_main_kb())
 
     if wg_data:
-        config_file = io.BytesIO(wg_data["config_text"].encode())
-        config_file.name = f"vpn_{data['name'].replace(' ', '_')}.conf"
+        config_file = BufferedInputFile(
+            wg_data["config_text"].encode(),
+            filename=f"vpn_{data['name'].replace(' ', '_')}.conf",
+        )
         await cb.message.answer_document(
             config_file,
             caption=f"🔑 Конфиг для <b>{data['name']}</b>\nIP: {wg_data['client_ip']}",
