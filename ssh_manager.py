@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import json
 import re
 import time
+import zlib
 from typing import Optional, Dict, List, Tuple
 import paramiko
 from config import ServerConfig, SERVERS
@@ -38,6 +40,19 @@ def _docker(cmd: str) -> str:
 
 def _sh_single_quote(command: str) -> str:
     return "'" + command.replace("'", "'\"'\"'") + "'"
+
+
+def _build_vpn_uri_from_config(config_text: str) -> str:
+    """
+    Формат ссылки, совместимый с импортом AmneziaVPN:
+    vpn:// + Base64Url(qCompress(config_text))
+    где qCompress = 4 байта длины (BE) + zlib(payload).
+    """
+    raw = config_text.encode("utf-8")
+    compressed = zlib.compress(raw, level=8)
+    payload = len(raw).to_bytes(4, byteorder="big") + compressed
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    return f"vpn://{encoded}"
 
 
 def _extract_awg_params(wg_show_out: str, conf_out: str) -> Dict[str, int]:
@@ -564,7 +579,8 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
         f"Endpoint = {server.host}:{port}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n"
     )
     return {"pubkey": pubkey, "privkey": privkey, "client_ip": client_ip,
-            "config_text": client_config, "server_name": server_name}
+            "config_text": client_config, "server_name": server_name,
+            "vpn_uri": _build_vpn_uri_from_config(client_config)}
 
 async def remove_peer(server_name: str, pubkey: str) -> bool:
     _, _, code = await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")

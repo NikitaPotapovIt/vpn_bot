@@ -756,6 +756,7 @@ async def create_key_do(cb: CallbackQuery):
     )
 
     file_name = f"vpn_client{client.id}_{server_name}_{datetime.now().strftime('%Y%m%d_%H%M')}.conf"
+    vpn_uri = wg_data.get("vpn_uri", "")
     admin_config = io.BytesIO(wg_data["config_text"].encode())
     admin_config.name = file_name
     await cb.message.answer_document(
@@ -768,8 +769,18 @@ async def create_key_do(cb: CallbackQuery):
         ),
         parse_mode="HTML",
     )
+    if vpn_uri:
+        await cb.message.answer(
+            (
+                "🔗 <b>Ссылка для импорта в Amnezia</b>\n"
+                f"<code>{html.escape(vpn_uri)}</code>"
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
     delivered_to_client = False
+    delivered_vpn_to_client = False
     try:
         client_config = io.BytesIO(wg_data["config_text"].encode())
         client_config.name = file_name
@@ -796,11 +807,39 @@ async def create_key_do(cb: CallbackQuery):
         delivered_to_client = True
     except Exception:
         logger.exception("failed to send new key to client %s", client.id)
+    if vpn_uri:
+        try:
+            link_msg = await cb.bot.send_message(
+                client.telegram_id,
+                (
+                    "🔗 <b>Ссылка для импорта в Amnezia</b>\n"
+                    f"<code>{html.escape(vpn_uri)}</code>\n\n"
+                    "⚠️ Это сообщение удалится через 1 час."
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            asyncio.create_task(
+                _delete_message_later(
+                    cb.bot,
+                    chat_id=client.telegram_id,
+                    message_id=link_msg.message_id,
+                    delay_sec=CLIENT_KEY_MESSAGE_TTL_SEC,
+                )
+            )
+            delivered_vpn_to_client = True
+        except Exception:
+            logger.exception("failed to send vpn:// link to client %s", client.id)
 
-    delivery_text = (
+    config_delivery_text = (
         "доставлен (сообщение удалится через 1 час)"
         if delivered_to_client
         else "не доставлен (проверь, писал ли он боту)"
+    )
+    vpn_delivery_text = (
+        "доставлена (сообщение удалится через 1 час)"
+        if delivered_vpn_to_client
+        else ("не сгенерирована" if not vpn_uri else "не доставлена")
     )
     await cb.message.edit_text(
         (
@@ -808,7 +847,8 @@ async def create_key_do(cb: CallbackQuery):
             f"Название: <b>{peer_name}</b>\n"
             f"Сервер: <b>{server_name}</b>\n"
             f"IP: <b>{wg_data['client_ip']}</b>\n\n"
-            f"Отправка клиенту: <b>{delivery_text}</b>"
+            f"Отправка .conf клиенту: <b>{config_delivery_text}</b>\n"
+            f"Отправка vpn:// клиенту: <b>{vpn_delivery_text}</b>"
         ),
         parse_mode="HTML",
         reply_markup=_with_home([
@@ -1797,6 +1837,15 @@ async def add_confirm(cb: CallbackQuery, state: FSMContext):
             caption=f"🔑 Конфиг для <b>{data['name']}</b>\nIP: {wg_data['client_ip']}",
             parse_mode="HTML",
         )
+        if wg_data.get("vpn_uri"):
+            await cb.message.answer(
+                (
+                    "🔗 <b>Ссылка для импорта в Amnezia</b>\n"
+                    f"<code>{html.escape(wg_data['vpn_uri'])}</code>"
+                ),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
 
 
 # ─── Подтверждение/отклонение оплаты ─────────────────────────────────────────
