@@ -259,7 +259,7 @@ async def _validate_awg_conf_text(server_name: str, conf_text: str) -> bool:
     Важно использовать *.conf, иначе wg-quick вернёт ошибку по имени файла.
     """
     cmd = (
-        "tmp_base=$(mktemp /tmp/wg_validate.XXXXXX) && "
+        "tmp_base=$(mktemp /tmp/wg0XXXXXX) && "
         "tmp_conf=\"${tmp_base}.conf\" && "
         "mv \"$tmp_base\" \"$tmp_conf\" && "
         "cat > \"$tmp_conf\" <<'CFGEOF'\n"
@@ -274,7 +274,7 @@ async def _validate_awg_conf_text(server_name: str, conf_text: str) -> bool:
 
 async def _sync_wg_runtime_from_conf(server_name: str, conf_path: str = "/opt/amnezia/awg/wg0.conf") -> bool:
     cmd = (
-        "tmp_base=$(mktemp /tmp/wg_sync.XXXXXX) && "
+        "tmp_base=$(mktemp /tmp/wg1XXXXXX) && "
         "tmp_conf=\"${tmp_base}.conf\" && "
         "mv \"$tmp_base\" \"$tmp_conf\" && "
         f"cp {conf_path} \"$tmp_conf\" && "
