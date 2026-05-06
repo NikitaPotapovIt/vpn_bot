@@ -167,6 +167,58 @@ def _remove_peer_from_conf_text(conf_text: str, pubkey: str) -> Tuple[str, bool]
     result = "\n".join(out_lines).rstrip() + "\n"
     return result, removed
 
+
+def _replace_peer_allowed_ips_in_conf_text(conf_text: str, pubkey: str, new_allowed_ips: str) -> Tuple[str, bool]:
+    lines = conf_text.splitlines()
+    out_lines: List[str] = []
+    i = 0
+    changed = False
+
+    while i < len(lines):
+        if lines[i].strip() != "[Peer]":
+            out_lines.append(lines[i])
+            i += 1
+            continue
+
+        block: List[str] = [lines[i]]
+        i += 1
+        while i < len(lines) and lines[i].strip() != "[Peer]":
+            block.append(lines[i])
+            i += 1
+
+        is_target = False
+        for ln in block:
+            normalized = re.sub(r"\s+", "", ln)
+            if normalized == f"PublicKey={pubkey}":
+                is_target = True
+                break
+
+        if not is_target:
+            out_lines.extend(block)
+            continue
+
+        replaced = False
+        new_block: List[str] = []
+        for ln in block:
+            if re.match(r"^\s*AllowedIPs\s*=", ln):
+                current_allowed = ln.split("=", 1)[1].strip() if "=" in ln else ""
+                if current_allowed != new_allowed_ips:
+                    new_block.append(f"AllowedIPs = {new_allowed_ips}")
+                    changed = True
+                else:
+                    new_block.append(ln)
+                replaced = True
+            else:
+                new_block.append(ln)
+        if not replaced:
+            new_block.append(f"AllowedIPs = {new_allowed_ips}")
+            changed = True
+        out_lines.extend(new_block)
+
+    result = "\n".join(out_lines).rstrip() + "\n"
+    return result, changed
+
+
 def _local_exec(command: str) -> Tuple[str, str, int]:
     import subprocess
     result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
@@ -656,11 +708,30 @@ async def remove_peer(server_name: str, pubkey: str) -> bool:
     return True
 
 async def disable_peer(server_name: str, pubkey: str) -> bool:
-    _, _, code = await _exec(server_name,
-        f"docker exec amnezia-awg wg set wg0 peer {pubkey} allowed-ips 192.0.2.0/32")
+    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    if conf_out is not None:
+        conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, "192.0.2.0/32")
+        if changed:
+            await _backup_awg_conf(server_name)
+            if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+                return False
+
+    _, _, code = await _exec(
+        server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} allowed-ips 192.0.2.0/32"
+    )
     return code == 0
 
 async def enable_peer(server_name: str, pubkey: str, client_ip: str) -> bool:
-    _, _, code = await _exec(server_name,
-        f"docker exec amnezia-awg wg set wg0 peer {pubkey} allowed-ips {client_ip}")
+    if not client_ip:
+        return False
+
+    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    if conf_out is not None:
+        conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, client_ip)
+        if changed:
+            await _backup_awg_conf(server_name)
+            if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+                return False
+
+    _, _, code = await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} allowed-ips {client_ip}")
     return code == 0

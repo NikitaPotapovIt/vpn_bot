@@ -45,8 +45,11 @@ from database import (
     unassign_key,
     delete_key_record,
     set_key_payer,
+    set_key_paused,
     set_key_billing_client,
     delete_client_record,
+    get_global_key_stats,
+    get_last_payment_log,
 )
 from ssh_manager import (
     get_server_status,
@@ -197,6 +200,19 @@ def _extend_paid_until(current_paid_until: Optional[str], months: int) -> str:
         start = today
     new_until = _add_months(start, months) - timedelta(days=1)
     return new_until.strftime("%Y-%m-%d")
+
+
+def _parse_payment_log_note(note: str) -> dict:
+    parsed = {}
+    if not note:
+        return parsed
+    for part in note.split(";"):
+        part = part.strip()
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        parsed[k.strip()] = v.strip()
+    return parsed
 
 
 async def _sync_peers_all_servers() -> Tuple[str, int]:
@@ -366,19 +382,32 @@ async def _apply_payment_confirmation(bot, client_id: int, months: int, source_m
         return
 
     months = max(1, months)
-    new_paid_until = _extend_paid_until(client.paid_until, months)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    is_correction = client.payment_status == "paid" and (client.payment_date == today_str)
+
+    base_paid_until = client.paid_until
+    if is_correction:
+        last_log = await get_last_payment_log(client_id, actions=["confirmed", "confirmed_corrected"])
+        if last_log and last_log.get("note"):
+            note_data = _parse_payment_log_note(last_log["note"])
+            base_from_note = note_data.get("base_paid_until")
+            if base_from_note is not None:
+                base_paid_until = None if base_from_note.lower() in ("none", "null", "") else base_from_note
+
+    new_paid_until = _extend_paid_until(base_paid_until, months)
     monthly_amount = float(client.monthly_fee)
     total_amount = monthly_amount * months
 
     await set_paid_until(client_id, new_paid_until)
-    await update_payment_status(client_id, "paid", datetime.now().strftime("%Y-%m-%d"))
+    await update_payment_status(client_id, "paid", today_str)
     await log_payment(
         client_id,
-        "confirmed",
+        "confirmed_corrected" if is_correction else "confirmed",
         total_amount,
         note=(
             f"months={months}; monthly={monthly_amount:.0f}; "
-            f"devices_payable={client.payable_key_count}; paid_until={new_paid_until}"
+            f"devices_payable={client.payable_key_count}; paid_until={new_paid_until}; "
+            f"base_paid_until={base_paid_until or 'none'}"
         ),
     )
 
@@ -387,7 +416,7 @@ async def _apply_payment_confirmation(bot, client_id: int, months: int, source_m
 
     await source_message.edit_text(
         (
-            f"✅ Оплата подтверждена\n\n"
+            f"{'✅ Оплата обновлена' if is_correction else '✅ Оплата подтверждена'}\n\n"
             f"Клиент: <b>{client.name}</b>\n"
             f"Срок: <b>{months} мес.</b>\n"
             f"Сумма: <b>{total_amount:.0f} ₽</b>\n"
@@ -403,7 +432,7 @@ async def _apply_payment_confirmation(bot, client_id: int, months: int, source_m
         await bot.send_message(
             client.telegram_id,
             (
-                f"✅ <b>Оплата подтверждена!</b>\n"
+                f"{'✅ <b>Оплата обновлена администратором</b>' if is_correction else '✅ <b>Оплата подтверждена!</b>'}\n"
                 f"Срок: <b>{months} мес.</b>\n"
                 f"Оплачено до: <b>{until_text}</b>\n"
                 f"Подключённых платных устройств: <b>{client.payable_key_count}</b>\n"
@@ -771,33 +800,7 @@ async def create_key_do(cb: CallbackQuery):
     if vpn_uri:
         await cb.message.answer(vpn_uri, disable_web_page_preview=True)
 
-    delivered_to_client = False
     delivered_vpn_to_client = False
-    try:
-        client_config = BufferedInputFile(wg_data["config_text"].encode(), filename=file_name)
-        sent_msg = await cb.bot.send_document(
-            client.telegram_id,
-            client_config,
-            caption=(
-                f"🔑 <b>Твой новый VPN-ключ</b>\n"
-                f"Название: <b>{peer_name}</b>\n"
-                f"Сервер: {server_name}\n"
-                f"IP: {wg_data['client_ip']}\n"
-                "⚠️ Сообщение с конфигом будет удалено через 1 час."
-            ),
-            parse_mode="HTML",
-        )
-        asyncio.create_task(
-            _delete_message_later(
-                cb.bot,
-                chat_id=client.telegram_id,
-                message_id=sent_msg.message_id,
-                delay_sec=CLIENT_KEY_MESSAGE_TTL_SEC,
-            )
-        )
-        delivered_to_client = True
-    except Exception:
-        logger.exception("failed to send new key to client %s", client.id)
     if vpn_uri:
         try:
             link_msg = await cb.bot.send_message(
@@ -817,11 +820,6 @@ async def create_key_do(cb: CallbackQuery):
         except Exception:
             logger.exception("failed to send vpn:// link to client %s", client.id)
 
-    config_delivery_text = (
-        "доставлен (сообщение удалится через 1 час)"
-        if delivered_to_client
-        else "не доставлен (проверь, писал ли он боту)"
-    )
     vpn_delivery_text = (
         "доставлена (сообщение удалится через 1 час)"
         if delivered_vpn_to_client
@@ -833,7 +831,6 @@ async def create_key_do(cb: CallbackQuery):
             f"Название: <b>{peer_name}</b>\n"
             f"Сервер: <b>{server_name}</b>\n"
             f"IP: <b>{wg_data['client_ip']}</b>\n\n"
-            f"Отправка .conf клиенту: <b>{config_delivery_text}</b>\n"
             f"Отправка vpn:// клиенту: <b>{vpn_delivery_text}</b>"
         ),
         parse_mode="HTML",
@@ -844,15 +841,7 @@ async def create_key_do(cb: CallbackQuery):
     )
 
 
-@router.callback_query(F.data.startswith("key_card:"))
-async def key_card(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return
-
-    _, key_id_str, client_id_str = cb.data.split(":")
-    key_id = int(key_id_str)
-    client_id = int(client_id_str)
-
+async def _show_key_card(cb: CallbackQuery, key_id: int, client_id: int):
     key = await get_key_by_id(key_id)
     if not key:
         await cb.answer("Ключ не найден")
@@ -862,7 +851,10 @@ async def key_card(cb: CallbackQuery):
         await cb.answer("У этого клиента нет доступа к ключу", show_alert=True)
         return
 
-    conn_text = "🟢 онлайн" if key.connected else f"🔴 офлайн (был: {_format_last_seen(key.last_handshake)})"
+    if key.paused:
+        conn_text = f"⏸ остановлен (был: {_format_last_seen(key.last_handshake)})"
+    else:
+        conn_text = "🟢 онлайн" if key.connected else f"🔴 офлайн (был: {_format_last_seen(key.last_handshake)})"
     if not key.payer:
         payer_text = "🚫 Неплательщик"
     elif key.billing_client_id == client_id:
@@ -891,6 +883,11 @@ async def key_card(cb: CallbackQuery):
 
     rows = [[
         InlineKeyboardButton(
+            text="▶️ Запустить ключ" if key.paused else "⏸ Остановить ключ",
+            callback_data=f"key_toggle_pause:{key.id}:{client_id}",
+        ),
+    ], [
+        InlineKeyboardButton(
             text="🚫 Сделать неплательщиком" if key.payer else "💰 Сделать платным",
             callback_data=f"key_toggle_payer:{key.id}:{client_id}",
         ),
@@ -910,6 +907,54 @@ async def key_card(cb: CallbackQuery):
     kb = _with_home(rows)
 
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("key_card:"))
+async def key_card(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    _, key_id_str, client_id_str = cb.data.split(":")
+    key_id = int(key_id_str)
+    client_id = int(client_id_str)
+    await _show_key_card(cb, key_id, client_id)
+
+
+@router.callback_query(F.data.startswith("key_toggle_pause:"))
+async def key_toggle_pause(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    _, key_id_str, client_id_str = cb.data.split(":")
+    key_id = int(key_id_str)
+    client_id = int(client_id_str)
+
+    key = await get_key_by_id(key_id)
+    if not key:
+        await cb.answer("Ключ не найден")
+        return
+
+    if key.paused:
+        if not key.allowed_ips or key.allowed_ips == "192.0.2.0/32":
+            await cb.answer("Не удалось определить IP ключа для запуска", show_alert=True)
+            return
+        ok = await enable_peer(key.server_name, key.wg_pubkey, key.allowed_ips)
+        if ok:
+            await set_key_paused(key_id, False)
+            await cb.answer("Ключ запущен")
+        else:
+            await cb.answer("Не удалось запустить ключ", show_alert=True)
+            return
+    else:
+        ok = await disable_peer(key.server_name, key.wg_pubkey)
+        if ok:
+            await set_key_paused(key_id, True)
+            await cb.answer("Ключ остановлен")
+        else:
+            await cb.answer("Не удалось остановить ключ", show_alert=True)
+            return
+
+    await _show_key_card(cb, key_id, client_id)
 
 
 @router.callback_query(F.data.startswith("key_toggle_payer:"))
@@ -1471,22 +1516,29 @@ async def show_stats(msg: Message):
         return
 
     clients = await get_all_clients()
+    key_stats = await get_global_key_stats()
+
     total = len(clients)
     active = sum(1 for c in clients if c.active)
-    paid = sum(1 for c in clients if _parse_date(c.paid_until) and _parse_date(c.paid_until) >= date.today())
-    waiting = sum(1 for c in clients if c.payment_status == "waiting_confirm")
-    pending = total - paid - waiting
+    billable_active = [c for c in clients if c.active and c.payable_key_count > 0]
+    billable_total = len(billable_active)
+    paid = sum(1 for c in billable_active if _parse_date(c.paid_until) and _parse_date(c.paid_until) >= date.today())
+    waiting = sum(1 for c in billable_active if c.payment_status == "waiting_confirm")
+    pending = max(0, billable_total - paid - waiting)
 
-    total_keys = sum(c.key_count for c in clients)
-    payable_keys = sum(c.payable_key_count for c in clients)
-    monthly = sum(c.monthly_fee for c in clients if c.active)
+    total_keys = key_stats["total_keys"]
+    payable_keys = key_stats["payable_keys"]
+    paused_keys = key_stats["paused_keys"]
+    monthly = sum(c.monthly_fee for c in billable_active)
 
     text = (
         f"<b>📊 Статистика</b>\n\n"
         f"Всего клиентов: <b>{total}</b>\n"
         f"Активных клиентов: <b>{active}</b>\n\n"
+        f"Платящих клиентов: <b>{billable_total}</b>\n\n"
         f"🔑 Ключей всего: <b>{total_keys}</b>\n"
         f"💰 Платных ключей: <b>{payable_keys}</b>\n"
+        f"⏸ Остановленных ключей: <b>{paused_keys}</b>\n"
         f"📦 Тариф за устройство: <b>{_device_price_text()}</b>\n\n"
         f"✅ Оплачено: <b>{paid}</b>\n"
         f"🔄 На проверке: <b>{waiting}</b>\n"

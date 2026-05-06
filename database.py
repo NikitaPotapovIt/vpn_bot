@@ -45,6 +45,7 @@ class ClientKey:
     endpoint: Optional[str]
     active: bool
     payer: bool
+    paused: bool
     client_id: Optional[int]  # legacy column (kept for compatibility)
     billing_client_id: Optional[int]
     billing_client_name: Optional[str] = None
@@ -136,6 +137,7 @@ async def init_db():
                 endpoint TEXT,
                 active INTEGER DEFAULT 1,
                 payer INTEGER DEFAULT 1,
+                paused INTEGER DEFAULT 0,
                 client_id INTEGER,
                 billing_client_id INTEGER,
                 UNIQUE(server_name, wg_pubkey),
@@ -178,6 +180,8 @@ async def init_db():
         key_columns = await _get_columns(db, "client_keys")
         if "billing_client_id" not in key_columns:
             await db.execute("ALTER TABLE client_keys ADD COLUMN billing_client_id INTEGER")
+        if "paused" not in key_columns:
+            await db.execute("ALTER TABLE client_keys ADD COLUMN paused INTEGER DEFAULT 0")
 
         await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_client_id ON client_keys(client_id)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_billing_client_id ON client_keys(billing_client_id)")
@@ -401,6 +405,33 @@ async def log_payment(client_id: int, action: str, amount: float = 0, note: str 
             (client_id, action, amount, datetime.now().isoformat(), note),
         )
         await db.commit()
+
+
+async def get_last_payment_log(client_id: int, actions: Optional[List[str]] = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if actions:
+            placeholders = ",".join("?" for _ in actions)
+            query = f"""
+                SELECT id, client_id, action, amount, timestamp, note
+                FROM payment_log
+                WHERE client_id = ? AND action IN ({placeholders})
+                ORDER BY id DESC
+                LIMIT 1
+            """
+            params = (client_id, *actions)
+        else:
+            query = """
+                SELECT id, client_id, action, amount, timestamp, note
+                FROM payment_log
+                WHERE client_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+            """
+            params = (client_id,)
+        async with db.execute(query, params) as cur:
+            row = await cur.fetchone()
+    return dict(row) if row else None
 
 
 async def update_client_fields(client_id: int, **kwargs):
@@ -752,6 +783,12 @@ async def set_key_payer(key_id: int, payer: bool):
         await db.commit()
 
 
+async def set_key_paused(key_id: int, paused: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE client_keys SET paused = ? WHERE id = ?", (1 if paused else 0, key_id))
+        await db.commit()
+
+
 async def set_key_billing_client(key_id: int, client_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await _ensure_key_access(db, key_id, client_id)
@@ -785,6 +822,27 @@ async def delete_client_record(client_id: int):
 
 async def get_payment_waiting_clients() -> List[Client]:
     return await _fetch_clients("WHERE c.payment_status = 'waiting_confirm'")
+
+
+async def get_global_key_stats() -> Dict[str, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT
+                COUNT(*) AS total_keys,
+                COALESCE(SUM(CASE WHEN payer = 1 THEN 1 ELSE 0 END), 0) AS payable_keys,
+                COALESCE(SUM(CASE WHEN paused = 1 THEN 1 ELSE 0 END), 0) AS paused_keys
+            FROM client_keys
+            WHERE active = 1
+            """
+        ) as cur:
+            row = await cur.fetchone()
+    return {
+        "total_keys": int(row["total_keys"] or 0),
+        "payable_keys": int(row["payable_keys"] or 0),
+        "paused_keys": int(row["paused_keys"] or 0),
+    }
 
 
 def _row_to_client(row) -> Client:
@@ -832,6 +890,7 @@ def _row_to_client_key(row) -> ClientKey:
         endpoint=row["endpoint"],
         active=bool(row["active"]),
         payer=bool(row["payer"]),
+        paused=bool(row["paused"]) if "paused" in row.keys() else False,
         client_id=row["client_id"] if "client_id" in row.keys() else None,
         billing_client_id=row["billing_client_id"] if "billing_client_id" in row.keys() else None,
         billing_client_name=row["billing_client_name"] if "billing_client_name" in row.keys() else None,
