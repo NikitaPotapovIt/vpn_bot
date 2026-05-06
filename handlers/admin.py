@@ -50,6 +50,7 @@ from database import (
     delete_client_record,
     get_global_key_stats,
     get_last_payment_log,
+    get_payment_logs_for_day,
 )
 from ssh_manager import (
     get_server_status,
@@ -213,6 +214,38 @@ def _parse_payment_log_note(note: str) -> dict:
         k, v = part.split("=", 1)
         parsed[k.strip()] = v.strip()
     return parsed
+
+
+def _extract_base_paid_until_from_log(log_row: Optional[dict]) -> Tuple[bool, Optional[str]]:
+    """Пытается восстановить исходный paid_until (до применения месяцев)."""
+    if not log_row:
+        return False, None
+
+    note_data = _parse_payment_log_note(log_row.get("note", ""))
+
+    if "base_paid_until" in note_data:
+        raw = (note_data.get("base_paid_until") or "").strip()
+        if raw.lower() in ("none", "null", ""):
+            return True, None
+        base_dt = _parse_date(raw[:10])
+        return (True, base_dt.strftime("%Y-%m-%d")) if base_dt else (False, None)
+
+    # Backward-compatible path for older notes without base_paid_until:
+    # derive it from "paid_until" and "months".
+    try:
+        months = int((note_data.get("months") or "").strip())
+    except Exception:
+        return False, None
+    if months < 1:
+        return False, None
+
+    paid_until_dt = _parse_date((note_data.get("paid_until") or "").strip()[:10])
+    if not paid_until_dt:
+        return False, None
+
+    start = paid_until_dt + timedelta(days=1)
+    base_dt = _add_months(start, -months) - timedelta(days=1)
+    return True, base_dt.strftime("%Y-%m-%d")
 
 
 async def _sync_peers_all_servers() -> Tuple[str, int]:
@@ -383,16 +416,27 @@ async def _apply_payment_confirmation(bot, client_id: int, months: int, source_m
 
     months = max(1, months)
     today_str = datetime.now().strftime("%Y-%m-%d")
-    is_correction = client.payment_status == "paid" and (client.payment_date == today_str)
+    payment_date_str = (client.payment_date or "").strip()[:10]
+    is_correction = client.payment_status == "paid" and (payment_date_str == today_str)
 
     base_paid_until = client.paid_until
     if is_correction:
-        last_log = await get_last_payment_log(client_id, actions=["confirmed", "confirmed_corrected"])
-        if last_log and last_log.get("note"):
-            note_data = _parse_payment_log_note(last_log["note"])
-            base_from_note = note_data.get("base_paid_until")
-            if base_from_note is not None:
-                base_paid_until = None if base_from_note.lower() in ("none", "null", "") else base_from_note
+        found_base = False
+        today_logs = await get_payment_logs_for_day(
+            client_id,
+            today_str,
+            actions=["confirmed", "confirmed_corrected"],
+        )
+        if today_logs:
+            # Берём первую операцию за день как якорь коррекции.
+            found_base, restored_base = _extract_base_paid_until_from_log(today_logs[0])
+            if found_base:
+                base_paid_until = restored_base
+        if not found_base:
+            last_log = await get_last_payment_log(client_id, actions=["confirmed", "confirmed_corrected"])
+            found_base, restored_base = _extract_base_paid_until_from_log(last_log)
+            if found_base:
+                base_paid_until = restored_base
 
     new_paid_until = _extend_paid_until(base_paid_until, months)
     monthly_amount = float(client.monthly_fee)

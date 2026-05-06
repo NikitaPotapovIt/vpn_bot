@@ -434,6 +434,35 @@ async def get_last_payment_log(client_id: int, actions: Optional[List[str]] = No
     return dict(row) if row else None
 
 
+async def get_payment_logs_for_day(client_id: int, day: str, actions: Optional[List[str]] = None):
+    """Возвращает платежные логи клиента за конкретную дату (YYYY-MM-DD), по возрастанию id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if actions:
+            placeholders = ",".join("?" for _ in actions)
+            query = f"""
+                SELECT id, client_id, action, amount, timestamp, note
+                FROM payment_log
+                WHERE client_id = ?
+                  AND substr(timestamp, 1, 10) = ?
+                  AND action IN ({placeholders})
+                ORDER BY id ASC
+            """
+            params = (client_id, day, *actions)
+        else:
+            query = """
+                SELECT id, client_id, action, amount, timestamp, note
+                FROM payment_log
+                WHERE client_id = ?
+                  AND substr(timestamp, 1, 10) = ?
+                ORDER BY id ASC
+            """
+            params = (client_id, day)
+        async with db.execute(query, params) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 async def update_client_fields(client_id: int, **kwargs):
     if not kwargs:
         return
