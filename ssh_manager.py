@@ -201,6 +201,55 @@ async def _write_awg_file(server_name: str, path: str, content: str, mode: str =
     return code == 0
 
 
+async def _validate_awg_conf_text(server_name: str, conf_text: str) -> bool:
+    """
+    Проверка синтаксиса через wg-quick strip.
+    Важно использовать *.conf, иначе wg-quick вернёт ошибку по имени файла.
+    """
+    cmd = (
+        "tmp_conf=$(mktemp /tmp/wg_validate.XXXXXX.conf) && "
+        "cat > \"$tmp_conf\" <<'CFGEOF'\n"
+        f"{conf_text}"
+        "CFGEOF\n"
+        "wg-quick strip \"$tmp_conf\" >/dev/null 2>&1; "
+        "rc=$?; rm -f \"$tmp_conf\"; exit $rc"
+    )
+    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(cmd)}"))
+    return code == 0
+
+
+async def _sync_wg_runtime_from_conf(server_name: str, conf_path: str = "/opt/amnezia/awg/wg0.conf") -> bool:
+    cmd = (
+        "tmp_conf=$(mktemp /tmp/wg_sync.XXXXXX.conf) && "
+        f"cp {conf_path} \"$tmp_conf\" && "
+        "wg-quick strip \"$tmp_conf\" > \"$tmp_conf.stripped\" && "
+        "wg syncconf wg0 \"$tmp_conf.stripped\"; "
+        "rc=$?; rm -f \"$tmp_conf\" \"$tmp_conf.stripped\"; exit $rc"
+    )
+    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(cmd)}"))
+    return code == 0
+
+
+async def _backup_awg_conf(server_name: str) -> bool:
+    cmd = "cp /opt/amnezia/awg/wg0.conf /opt/amnezia/awg/wg0.conf.autobak_$(date +%Y%m%d_%H%M%S)"
+    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(cmd)}"))
+    return code == 0
+
+
+async def _apply_awg_conf_with_rollback(server_name: str, conf_new: str, conf_old: str) -> bool:
+    if not await _validate_awg_conf_text(server_name, conf_new):
+        return False
+    if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
+        return False
+    if await _sync_wg_runtime_from_conf(server_name):
+        return True
+
+    # Откат в случае ошибки применения runtime
+    await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_old, mode="600")
+    await _sync_wg_runtime_from_conf(server_name)
+    return False
+
+
 async def _load_clients_table_strict(server_name: str) -> Optional[List[Dict]]:
     raw = await _read_awg_file(server_name, "/opt/amnezia/awg/clientsTable")
     if raw is None:
@@ -532,6 +581,9 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     port = port_match.group(1) if port_match else "46742"
 
     conf_new = _append_peer_to_conf_text(conf_out, client_name, pubkey, psk, client_ip)
+    if not await _validate_awg_conf_text(server_name, conf_new):
+        return None
+    await _backup_awg_conf(server_name)
     if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
         return None
 
@@ -551,7 +603,9 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     _, _, apply_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
     if apply_code != 0:
         # Если runtime-применение не удалось, откатываем файл конфига.
+        await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
         await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_out, mode="600")
+        await _sync_wg_runtime_from_conf(server_name)
         return None
 
     # Обновляем clientsTable (при повреждении файла не перетираем его).
@@ -583,16 +637,17 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
             "vpn_uri": _build_vpn_uri_from_config(client_config)}
 
 async def remove_peer(server_name: str, pubkey: str) -> bool:
-    _, _, code = await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
-    if code != 0:
-        return False
-
     conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
     if conf_out is None:
         return False
-    conf_new, _ = _remove_peer_from_conf_text(conf_out, pubkey)
-    if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
-        return False
+    conf_new, removed = _remove_peer_from_conf_text(conf_out, pubkey)
+    if removed:
+        await _backup_awg_conf(server_name)
+        if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+            return False
+
+    # На случай рассинхрона runtime/config удаляем peer в runtime best-effort.
+    await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
 
     table = await _load_clients_table_strict(server_name)
     if table is not None:
