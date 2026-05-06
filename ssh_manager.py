@@ -374,14 +374,34 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     port_match = re.search(r"listening port:\s*(\d+)", wg_show_out)
     port = port_match.group(1) if port_match else "46742"
 
-    # Добавляем peer
-    add_cmd = (
-        f"docker exec amnezia-awg sh -c "
-        f"'echo \"[Peer]\\n# {client_name}\\nPublicKey = {pubkey}\\n"
-        f"PresharedKey = {psk}\\nAllowedIPs = {client_ip}\\n\" >> /opt/amnezia/awg/wg0.conf && "
-        f"wg set wg0 peer {pubkey} preshared-key <(echo {psk}) allowed-ips {client_ip}'"
+    # Добавляем peer:
+    # 1) Надёжно дописываем блок в wg0.conf (без literal "\n" из echo в разных sh).
+    # 2) Пытаемся применить к живому wg0; если интерфейс сейчас не поднят, конфиг всё равно сохранится.
+    safe_client_name = client_name.replace("\n", " ").replace("\r", " ")
+    peer_lines = [
+        "[Peer]",
+        f"# {safe_client_name}",
+        f"PublicKey = {pubkey}",
+        f"PresharedKey = {psk}",
+        f"AllowedIPs = {client_ip}",
+        "",
+    ]
+    append_peer_cmd = (
+        "printf '%s\\n' "
+        + " ".join(_sh_single_quote(line) for line in peer_lines)
+        + " >> /opt/amnezia/awg/wg0.conf"
     )
-    await _exec(server_name, add_cmd)
+    _, _, append_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(append_peer_cmd)}"))
+    if append_code != 0:
+        return None
+
+    runtime_apply_cmd = (
+        f"tmp_psk=$(mktemp) && "
+        f"printf '%s' {_sh_single_quote(psk)} > \"$tmp_psk\" && "
+        f"wg set wg0 peer {pubkey} preshared-key \"$tmp_psk\" allowed-ips {client_ip}; "
+        f"rc=$?; rm -f \"$tmp_psk\"; exit $rc"
+    )
+    await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
 
     # Обновляем clientsTable
     import datetime
@@ -394,8 +414,14 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
             "creationDate": datetime.datetime.now().strftime("%a %b %-d %H:%M:%S %Y"),
         }
     })
-    table_json = json.dumps(table, indent=4, ensure_ascii=False).replace("'", "'\\''")
-    await _exec(server_name, f"docker exec amnezia-awg sh -c 'cat > /opt/amnezia/awg/clientsTable' << 'JSONEOF'\n{table_json}\nJSONEOF")
+    table_json = json.dumps(table, indent=4, ensure_ascii=False)
+    write_table_cmd = (
+        "cat > /opt/amnezia/awg/clientsTable <<'JSONEOF'\n"
+        f"{table_json}\n"
+        "JSONEOF\n"
+        "chmod 644 /opt/amnezia/awg/clientsTable"
+    )
+    await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(write_table_cmd)}"))
 
     server = _get_server(server_name)
     amnezia_params = ""
