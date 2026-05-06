@@ -395,11 +395,25 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     if append_code != 0:
         return None
 
+    awg_restore_cmd = ""
+    if jc:
+        awg_restore_cmd = (
+            f"wg set wg0 "
+            f"jc {jc.group(1)} "
+            f"jmin {jmin.group(1) if jmin else 50} "
+            f"jmax {jmax.group(1) if jmax else 1000} "
+            f"s1 {s1.group(1) if s1 else 0} "
+            f"s2 {s2.group(1) if s2 else 0} "
+            f"h1 1 h2 2 h3 3 h4 4"
+        )
+
     runtime_apply_cmd = (
         f"tmp_psk=$(mktemp) && "
         f"printf '%s' {_sh_single_quote(psk)} > \"$tmp_psk\" && "
         f"wg set wg0 peer {pubkey} preshared-key \"$tmp_psk\" allowed-ips {client_ip}; "
-        f"rc=$?; rm -f \"$tmp_psk\"; exit $rc"
+        f"rc=$?; "
+        + (f"if [ $rc -eq 0 ]; then {awg_restore_cmd}; fi; " if awg_restore_cmd else "")
+        + f"rm -f \"$tmp_psk\"; exit $rc"
     )
     await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
 
