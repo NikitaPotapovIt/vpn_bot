@@ -203,6 +203,18 @@ def _parse_speedtest_simple(output: str) -> Dict:
     return data
 
 
+def _is_nonzero_speed_result(data: Dict) -> bool:
+    try:
+        dl = float(data.get("download_mbps") or 0)
+    except Exception:
+        dl = 0.0
+    try:
+        ul = float(data.get("upload_mbps") or 0)
+    except Exception:
+        ul = 0.0
+    return dl > 0.1 or ul > 0.1
+
+
 def _parse_wget_download(output: str) -> Optional[float]:
     match = re.search(r"([\d.]+)\s*([KMG])b(?:it)?/s", output)
     if not match:
@@ -231,7 +243,9 @@ async def _speed_test_ctx(server_name: str, context: str) -> Dict:
         result_out, _, code2 = await _exec_in_context(server_name, f"{binary} --simple 2>&1", context)
         if code2 == 0:
             data = _parse_speedtest_simple(result_out)
-            if data:
+            # Некоторые версии speedtest-cli в контейнере возвращают 0.00/0.00.
+            # В таком случае считаем результат невалидным и пробуем альтернативы.
+            if data and _is_nonzero_speed_result(data):
                 return {"success": True, "context": location, "method": "speedtest-cli", **data}
 
     # Попытка 2: wget (download only)

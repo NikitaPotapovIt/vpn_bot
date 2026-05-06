@@ -175,6 +175,7 @@ async def _build_clients_view_text() -> Tuple[str, InlineKeyboardMarkup]:
             f"Непривязанные ключи: <b>{len(unlinked)}</b>"
         )
         kb = _with_home([
+            [InlineKeyboardButton(text="➕ Создать клиента", callback_data="add_client_inline")],
             [InlineKeyboardButton(text="🔄 Импорт peer'ов", callback_data="sync_peers_now")],
             [InlineKeyboardButton(text="🧩 Непривязанные ключи", callback_data="show_unlinked_info")],
         ])
@@ -193,6 +194,7 @@ async def _build_clients_view_text() -> Tuple[str, InlineKeyboardMarkup]:
     text_lines.append(f"🧩 Непривязанных ключей: <b>{len(unlinked)}</b>")
 
     rows = [
+        [InlineKeyboardButton(text="➕ Создать клиента", callback_data="add_client_inline")],
         [InlineKeyboardButton(text="🔄 Импорт peer'ов", callback_data="sync_peers_now")],
         [InlineKeyboardButton(text="🧩 Непривязанные ключи", callback_data="show_unlinked_info")],
     ]
@@ -455,7 +457,7 @@ async def show_unlinked_info(cb: CallbackQuery):
         "<b>🧩 Непривязанные ключи</b>",
         "",
         f"Всего: <b>{len(keys)}</b>",
-        "Привязка выполняется из карточки клиента: <b>Ключи → Привязать ключ</b>",
+        "Можно создать клиента сразу из ключа, либо привязать к существующему клиенту.",
         "",
     ]
 
@@ -469,10 +471,17 @@ async def show_unlinked_info(cb: CallbackQuery):
     if len(keys) > 20:
         lines.append(f"\n... и ещё {len(keys) - 20} ключей")
 
+    rows = [[InlineKeyboardButton(text="➕ Создать клиента (вручную)", callback_data="add_client_inline")]]
+    for k in keys[:10]:
+        online = "🟢" if k.connected else "🔴"
+        label = f"{online}➕ {k.key_name or k.wg_pubkey[:8]} | {k.server_name}"
+        rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"create_from_key:{k.id}")])
+    rows.append([InlineKeyboardButton(text="◀️ К клиентам", callback_data="back_to_clients")])
+
     await cb.message.edit_text(
         "\n".join(lines),
         parse_mode="HTML",
-        reply_markup=_with_home([[InlineKeyboardButton(text="◀️ К клиентам", callback_data="back_to_clients")]]),
+        reply_markup=_with_home(rows),
     )
 
 
@@ -1143,6 +1152,55 @@ class PaymentMonthsForm(StatesGroup):
     months = State()
 
 
+@router.callback_query(F.data == "add_client_inline")
+async def add_client_inline(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+    await state.clear()
+    await cb.message.answer(
+        "Введи <b>Telegram ID</b> нового клиента:",
+        parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
+    await state.set_state(AddClientForm.telegram_id)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("create_from_key:"))
+async def create_client_from_key(cb: CallbackQuery, state: FSMContext):
+    if not is_admin(cb.from_user.id):
+        return
+
+    key_id = int(cb.data.split(":")[1])
+    key = await get_key_by_id(key_id)
+    if not key:
+        await cb.answer("Ключ не найден", show_alert=True)
+        return
+    if key.client_id:
+        await cb.answer("Ключ уже привязан. Обнови список.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(
+        bind_key_id=key.id,
+        server=key.server_name,
+        suggested_name=(key.key_name or f"Client-{key.id}"),
+        key_preview=(key.key_name or key.wg_pubkey[:8]),
+    )
+    await state.set_state(AddClientForm.telegram_id)
+
+    await cb.message.answer(
+        (
+            f"🔗 Создание клиента из ключа <b>{key.key_name or key.wg_pubkey[:8]}</b>\n"
+            f"Сервер: <b>{key.server_name}</b>\n\n"
+            "Введи <b>Telegram ID</b> клиента:"
+        ),
+        parse_mode="HTML",
+        reply_markup=back_kb(),
+    )
+    await cb.answer()
+
+
 @router.message(F.text == "➕ Добавить клиента")
 @router.message(Command("add_client"))
 async def cmd_add_client(msg: Message, state: FSMContext):
@@ -1188,6 +1246,16 @@ async def go_back(msg: Message, state: FSMContext):
         await msg.answer("Отменено.", reply_markup=admin_main_kb())
         return
 
+    data = await state.get_data()
+    if current == str(AddClientForm.confirm) and data.get("bind_key_id"):
+        await state.set_state(AddClientForm.username)
+        await msg.answer(
+            "Введи <b>@username</b> (без @, или '-'):",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
+        return
+
     try:
         idx = [str(s) for s in states_order].index(current)
     except ValueError:
@@ -1225,7 +1293,12 @@ async def add_tg_id(msg: Message, state: FSMContext):
         return
 
     await state.update_data(telegram_id=tg_id)
-    await msg.answer("Введи <b>имя</b> клиента:", parse_mode="HTML", reply_markup=back_kb())
+    data = await state.get_data()
+    suggested_name = data.get("suggested_name")
+    prompt = "Введи <b>имя</b> клиента:"
+    if suggested_name:
+        prompt = f"Введи <b>имя</b> клиента (например: <code>{suggested_name}</code>):"
+    await msg.answer(prompt, parse_mode="HTML", reply_markup=back_kb())
     await state.set_state(AddClientForm.name)
 
 
@@ -1250,6 +1323,40 @@ async def add_username(msg: Message, state: FSMContext):
 
     username = msg.text.strip().lstrip("@")
     await state.update_data(username=None if username == "-" else username)
+
+    data = await state.get_data()
+    bind_key_id = data.get("bind_key_id")
+    if bind_key_id:
+        key = await get_key_by_id(int(bind_key_id))
+        if not key:
+            await state.clear()
+            await msg.answer("❌ Ключ не найден. Начни снова.", reply_markup=admin_main_kb())
+            return
+        if key.client_id:
+            await state.clear()
+            await msg.answer("❌ Ключ уже привязан к другому клиенту.", reply_markup=admin_main_kb())
+            return
+
+        await state.update_data(server=key.server_name)
+        data = await state.get_data()
+        summary = (
+            f"<b>Проверь данные:</b>\n\n"
+            f"Telegram ID: <code>{data['telegram_id']}</code>\n"
+            f"Имя: {data['name']}\n"
+            f"Username: @{data.get('username') or '-'}\n"
+            f"Сервер: {key.server_name}\n"
+            f"Ключ: {key.key_name or key.wg_pubkey[:8]} ({key.allowed_ips or '—'})\n\n"
+            f"Тариф по умолчанию: {_device_price_text()} за платное устройство\n"
+            f"(сумма считается по связанным ключам)\n\n"
+            f"Создать клиента и привязать этот ключ?"
+        )
+        kb = _with_home([
+            [InlineKeyboardButton(text="✅ Создать и привязать ключ", callback_data="add_bind_key")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="add_cancel")],
+        ])
+        await msg.answer(summary, parse_mode="HTML", reply_markup=kb)
+        await state.set_state(AddClientForm.confirm)
+        return
 
     kb = _with_home(
         [[InlineKeyboardButton(text=s.name, callback_data=f"sel_srv:{s.name}")] for s in SERVERS]
@@ -1287,7 +1394,7 @@ async def add_server(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AddClientForm.confirm)
 
 
-@router.callback_query(AddClientForm.confirm, F.data.in_({"add_with_wg", "add_no_wg", "add_cancel"}))
+@router.callback_query(AddClientForm.confirm, F.data.in_({"add_with_wg", "add_no_wg", "add_bind_key", "add_cancel"}))
 async def add_confirm(cb: CallbackQuery, state: FSMContext):
     if cb.data == "add_cancel":
         await state.clear()
@@ -1307,22 +1414,46 @@ async def add_confirm(cb: CallbackQuery, state: FSMContext):
             await cb.message.answer("⚠️ Не удалось создать ключ. Добавляю клиента без ключа.")
 
     try:
-        client_id = await add_client(
-            telegram_id=data["telegram_id"],
-            name=data["name"],
-            username=data.get("username"),
-            server_name=data["server"],
-            devices=0,
-            monthly_fee=0,
-            wg_pubkey=wg_data["pubkey"] if wg_data else None,
-            wg_peer_id=wg_data["client_ip"] if wg_data else None,
-        )
+        if cb.data == "add_bind_key":
+            bind_key_id = int(data.get("bind_key_id", 0))
+            key = await get_key_by_id(bind_key_id)
+            if not key:
+                await cb.message.edit_text("❌ Ключ не найден. Попробуй снова.")
+                return
+            if key.client_id:
+                await cb.message.edit_text("❌ Ключ уже привязан к другому клиенту.")
+                return
+
+            client_id = await add_client(
+                telegram_id=data["telegram_id"],
+                name=data["name"],
+                username=data.get("username"),
+                server_name=key.server_name,
+                devices=0,
+                monthly_fee=0,
+                wg_pubkey=key.wg_pubkey,
+                wg_peer_id=key.allowed_ips,
+            )
+        else:
+            client_id = await add_client(
+                telegram_id=data["telegram_id"],
+                name=data["name"],
+                username=data.get("username"),
+                server_name=data["server"],
+                devices=0,
+                monthly_fee=0,
+                wg_pubkey=wg_data["pubkey"] if wg_data else None,
+                wg_peer_id=wg_data["client_ip"] if wg_data else None,
+            )
     except Exception as e:
         logger.exception("add client failed")
         await cb.message.edit_text(f"❌ Не удалось добавить клиента: {e}")
         return
 
-    await cb.message.edit_text(f"✅ <b>{data['name']}</b> добавлен (id={client_id})!", parse_mode="HTML")
+    ok_text = f"✅ <b>{data['name']}</b> добавлен (id={client_id})!"
+    if cb.data == "add_bind_key":
+        ok_text += "\nКлюч успешно привязан."
+    await cb.message.edit_text(ok_text, parse_mode="HTML")
     await cb.message.answer("Главное меню:", reply_markup=admin_main_kb())
 
     if wg_data:
