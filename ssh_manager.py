@@ -297,12 +297,22 @@ async def _apply_awg_conf_with_rollback(server_name: str, conf_new: str, conf_ol
         return False
     if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
         return False
+
+    restore_new_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_new))
     if await _sync_wg_runtime_from_conf(server_name):
-        return True
+        if restore_new_cmd:
+            _, _, restore_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(restore_new_cmd)}"))
+            if restore_code == 0:
+                return True
+        else:
+            return True
 
     # Откат в случае ошибки применения runtime
     await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_old, mode="600")
-    await _sync_wg_runtime_from_conf(server_name)
+    if await _sync_wg_runtime_from_conf(server_name):
+        restore_old_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_old))
+        if restore_old_cmd:
+            await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(restore_old_cmd)}"))
     return False
 
 
@@ -702,9 +712,6 @@ async def remove_peer(server_name: str, pubkey: str) -> bool:
         if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
             return False
 
-    # На случай рассинхрона runtime/config удаляем peer в runtime best-effort.
-    await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
-
     table = await _load_clients_table_strict(server_name)
     if table is not None:
         table = [c for c in table if c.get("clientId") != pubkey]
@@ -713,29 +720,27 @@ async def remove_peer(server_name: str, pubkey: str) -> bool:
 
 async def disable_peer(server_name: str, pubkey: str) -> bool:
     conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
-    if conf_out is not None:
-        conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, "192.0.2.0/32")
-        if changed:
-            await _backup_awg_conf(server_name)
-            if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
-                return False
+    if conf_out is None:
+        return False
 
-    _, _, code = await _exec(
-        server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} allowed-ips 192.0.2.0/32"
-    )
-    return code == 0
+    conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, "192.0.2.0/32")
+    if changed:
+        await _backup_awg_conf(server_name)
+        if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+            return False
+    return True
 
 async def enable_peer(server_name: str, pubkey: str, client_ip: str) -> bool:
     if not client_ip:
         return False
 
     conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
-    if conf_out is not None:
-        conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, client_ip)
-        if changed:
-            await _backup_awg_conf(server_name)
-            if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
-                return False
+    if conf_out is None:
+        return False
 
-    _, _, code = await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} allowed-ips {client_ip}")
-    return code == 0
+    conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, client_ip)
+    if changed:
+        await _backup_awg_conf(server_name)
+        if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+            return False
+    return True
