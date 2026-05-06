@@ -1,10 +1,12 @@
 import aiosqlite
-import asyncio
 from datetime import datetime, date
-from typing import Optional, List
+from typing import Optional, List, Dict
 from dataclasses import dataclass
 
+from config import DEVICE_MONTHLY_PRICE
+
 DB_PATH = "vpn_bot.db"
+
 
 @dataclass
 class Client:
@@ -14,18 +16,62 @@ class Client:
     username: Optional[str]
     server_name: str
     devices: int
-    monthly_fee: float  # в рублях/валюте
+    monthly_fee: float
     active: bool
-    payment_status: str  # "pending" | "waiting_confirm" | "paid" | "overdue"
-    payment_date: Optional[str]  # дата последней оплаты
-    reminder_day: int   # сколько дней прошло с 1-го числа (счётчик напоминаний)
-    disconnect_date: Optional[str]  # запланированная дата отключения
-    wg_pubkey: Optional[str]  # публичный ключ WireGuard клиента
-    wg_peer_id: Optional[str] # идентификатор peer на сервере
+    payment_status: str
+    payment_date: Optional[str]
+    reminder_day: int
+    disconnect_date: Optional[str]
+    wg_pubkey: Optional[str]
+    wg_peer_id: Optional[str]
+    paid_until: Optional[str]
+    key_count: int = 0
+    payable_key_count: int = 0
+    nonpayable_key_count: int = 0
+
+
+@dataclass
+class ClientKey:
+    id: int
+    server_name: str
+    wg_pubkey: str
+    key_name: Optional[str]
+    allowed_ips: Optional[str]
+    created_at: Optional[str]
+    connected: bool
+    last_handshake: int
+    rx_bytes: int
+    tx_bytes: int
+    endpoint: Optional[str]
+    active: bool
+    payer: bool
+    client_id: Optional[int]
+
+
+def _calc_monthly_fee(payable_devices: int, fallback_fee: float) -> float:
+    if payable_devices > 0:
+        return float(payable_devices * DEVICE_MONTHLY_PRICE)
+    return float(fallback_fee)
+
+
+def _calc_devices(key_count: int, fallback_devices: int) -> int:
+    if key_count > 0:
+        return int(key_count)
+    return int(fallback_devices)
+
+
+async def _get_columns(db: aiosqlite.Connection, table_name: str) -> List[str]:
+    async with db.execute(f"PRAGMA table_info({table_name})") as cur:
+        rows = await cur.fetchall()
+    return [r[1] for r in rows]
+
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+        await db.execute("PRAGMA foreign_keys = ON")
+
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS clients (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER UNIQUE,
@@ -40,10 +86,37 @@ async def init_db():
                 reminder_day INTEGER DEFAULT 0,
                 disconnect_date TEXT,
                 wg_pubkey TEXT,
-                wg_peer_id TEXT
+                wg_peer_id TEXT,
+                paid_until TEXT
             )
-        """)
-        await db.execute("""
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS client_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_name TEXT NOT NULL,
+                wg_pubkey TEXT NOT NULL,
+                key_name TEXT,
+                allowed_ips TEXT,
+                created_at TEXT,
+                connected INTEGER DEFAULT 0,
+                last_handshake INTEGER DEFAULT 0,
+                rx_bytes INTEGER DEFAULT 0,
+                tx_bytes INTEGER DEFAULT 0,
+                endpoint TEXT,
+                active INTEGER DEFAULT 1,
+                payer INTEGER DEFAULT 1,
+                client_id INTEGER,
+                UNIQUE(server_name, wg_pubkey),
+                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE SET NULL
+            )
+            """
+        )
+
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS payment_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 client_id INTEGER,
@@ -52,107 +125,199 @@ async def init_db():
                 timestamp TEXT,
                 note TEXT
             )
-        """)
+            """
+        )
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_client_id ON client_keys(client_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_server ON client_keys(server_name)")
+
+        # Миграция старых баз
+        client_columns = await _get_columns(db, "clients")
+        if "paid_until" not in client_columns:
+            await db.execute("ALTER TABLE clients ADD COLUMN paid_until TEXT")
+
+        # Перенос legacy-полей wg_pubkey/wg_peer_id в новую таблицу ключей
+        async with db.execute(
+            "SELECT id, server_name, name, active, wg_pubkey, wg_peer_id FROM clients WHERE wg_pubkey IS NOT NULL AND wg_pubkey != ''"
+        ) as cur:
+            legacy_rows = await cur.fetchall()
+
+        for row in legacy_rows:
+            client_id, server_name, client_name, active, wg_pubkey, wg_peer_id = row
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO client_keys (
+                    server_name, wg_pubkey, key_name, allowed_ips, active, payer, client_id
+                ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                """,
+                (server_name, wg_pubkey, client_name, wg_peer_id, 1 if active else 0, client_id),
+            )
+
         await db.commit()
 
-async def add_client(telegram_id: int, name: str, username: str,
-                     server_name: str, devices: int, monthly_fee: float,
-                     wg_pubkey: str = None, wg_peer_id: str = None) -> int:
+
+async def add_client(
+    telegram_id: int,
+    name: str,
+    username: str,
+    server_name: str,
+    devices: int,
+    monthly_fee: float,
+    wg_pubkey: str = None,
+    wg_peer_id: str = None,
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            INSERT INTO clients (telegram_id, name, username, server_name, devices, monthly_fee,
-                                 payment_status, wg_pubkey, wg_peer_id)
+        await db.execute("PRAGMA foreign_keys = ON")
+        cur = await db.execute(
+            """
+            INSERT INTO clients (
+                telegram_id, name, username, server_name, devices, monthly_fee, payment_status, wg_pubkey, wg_peer_id
+            )
             VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
-        """, (telegram_id, name, username, server_name, devices, monthly_fee, wg_pubkey, wg_peer_id))
+            """,
+            (telegram_id, name, username, server_name, devices, monthly_fee, wg_pubkey, wg_peer_id),
+        )
+        client_id = cur.lastrowid
+
+        if wg_pubkey:
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO client_keys (
+                    server_name, wg_pubkey, key_name, allowed_ips, active, payer, client_id
+                ) VALUES (?, ?, ?, ?, 1, 1, ?)
+                """,
+                (server_name, wg_pubkey, name, wg_peer_id, client_id),
+            )
+            await db.execute(
+                """
+                UPDATE client_keys
+                SET client_id = ?, key_name = COALESCE(key_name, ?), allowed_ips = COALESCE(allowed_ips, ?)
+                WHERE server_name = ? AND wg_pubkey = ?
+                """,
+                (client_id, name, wg_peer_id, server_name, wg_pubkey),
+            )
+
         await db.commit()
-        return cur.lastrowid
+        return client_id
+
+
+async def _fetch_clients(where_sql: str = "", params: tuple = ()) -> List[Client]:
+    query = f"""
+        SELECT
+            c.*,
+            COALESCE(COUNT(k.id), 0) AS key_count,
+            COALESCE(SUM(CASE WHEN k.payer = 1 THEN 1 ELSE 0 END), 0) AS payable_key_count
+        FROM clients c
+        LEFT JOIN client_keys k ON k.client_id = c.id AND k.active = 1
+        {where_sql}
+        GROUP BY c.id
+        ORDER BY c.name
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cur:
+            rows = await cur.fetchall()
+            return [_row_to_client(r) for r in rows]
+
 
 async def get_client_by_tg(telegram_id: int) -> Optional[Client]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM clients WHERE telegram_id = ?", (telegram_id,)) as cur:
-            row = await cur.fetchone()
-            return _row_to_client(row) if row else None
+    clients = await _fetch_clients("WHERE c.telegram_id = ?", (telegram_id,))
+    return clients[0] if clients else None
+
 
 async def get_client_by_id(client_id: int) -> Optional[Client]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM clients WHERE id = ?", (client_id,)) as cur:
-            row = await cur.fetchone()
-            return _row_to_client(row) if row else None
+    clients = await _fetch_clients("WHERE c.id = ?", (client_id,))
+    return clients[0] if clients else None
+
 
 async def get_all_clients() -> List[Client]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM clients ORDER BY name") as cur:
-            rows = await cur.fetchall()
-            return [_row_to_client(r) for r in rows]
+    return await _fetch_clients()
+
 
 async def get_active_clients() -> List[Client]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM clients WHERE active = 1") as cur:
-            rows = await cur.fetchall()
-            return [_row_to_client(r) for r in rows]
+    return await _fetch_clients("WHERE c.active = 1")
+
 
 async def update_payment_status(client_id: int, status: str, payment_date: str = None):
     async with aiosqlite.connect(DB_PATH) as db:
         if payment_date:
             await db.execute(
-                "UPDATE clients SET payment_status = ?, payment_date = ?, reminder_day = 0, disconnect_date = NULL WHERE id = ?",
-                (status, payment_date, client_id)
+                """
+                UPDATE clients
+                SET payment_status = ?, payment_date = ?, reminder_day = 0, disconnect_date = NULL
+                WHERE id = ?
+                """,
+                (status, payment_date, client_id),
             )
         else:
-            await db.execute(
-                "UPDATE clients SET payment_status = ? WHERE id = ?",
-                (status, client_id)
-            )
+            await db.execute("UPDATE clients SET payment_status = ? WHERE id = ?", (status, client_id))
         await db.commit()
+
+
+async def set_paid_until(client_id: int, paid_until: Optional[str]):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE clients SET paid_until = ? WHERE id = ?", (paid_until, client_id))
+        await db.commit()
+
 
 async def increment_reminder_day(client_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE clients SET reminder_day = reminder_day + 1 WHERE id = ?",
-            (client_id,)
-        )
+        await db.execute("UPDATE clients SET reminder_day = reminder_day + 1 WHERE id = ?", (client_id,))
         await db.commit()
+
 
 async def set_disconnect_date(client_id: int, disconnect_date: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE clients SET disconnect_date = ? WHERE id = ?",
-            (disconnect_date, client_id)
-        )
+        await db.execute("UPDATE clients SET disconnect_date = ? WHERE id = ?", (disconnect_date, client_id))
         await db.commit()
+
 
 async def set_client_active(client_id: int, active: bool):
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE clients SET active = ? WHERE id = ?", (1 if active else 0, client_id))
+        await db.commit()
+
+
+async def reset_monthly_payments():
+    """1-го числа: pending только у реально неоплаченных клиентов"""
+    today = date.today().strftime("%Y-%m-%d")
+    async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE clients SET active = ? WHERE id = ?",
-            (1 if active else 0, client_id)
+            """
+            UPDATE clients
+            SET payment_status = 'pending', reminder_day = 0, disconnect_date = NULL
+            WHERE active = 1
+              AND payment_status != 'waiting_confirm'
+              AND (paid_until IS NULL OR paid_until < ?)
+            """,
+            (today,),
+        )
+        await db.execute(
+            """
+            UPDATE clients
+            SET payment_status = 'paid', reminder_day = 0, disconnect_date = NULL
+            WHERE active = 1
+              AND paid_until IS NOT NULL
+              AND paid_until >= ?
+            """,
+            (today,),
         )
         await db.commit()
 
-async def reset_monthly_payments():
-    """Вызывается 1-го числа — сбрасывает статусы для нового цикла"""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            UPDATE clients 
-            SET payment_status = 'pending', reminder_day = 0, disconnect_date = NULL
-            WHERE active = 1
-        """)
-        await db.commit()
 
 async def log_payment(client_id: int, action: str, amount: float = 0, note: str = ""):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+        await db.execute(
+            """
             INSERT INTO payment_log (client_id, action, amount, timestamp, note)
             VALUES (?, ?, ?, ?, ?)
-        """, (client_id, action, amount, datetime.now().isoformat(), note))
+            """,
+            (client_id, action, amount, datetime.now().isoformat(), note),
+        )
         await db.commit()
 
+
 async def update_client_fields(client_id: int, **kwargs):
-    """Универсальное обновление полей клиента"""
     if not kwargs:
         return
     fields = ", ".join(f"{k} = ?" for k in kwargs)
@@ -161,15 +326,278 @@ async def update_client_fields(client_id: int, **kwargs):
         await db.execute(f"UPDATE clients SET {fields} WHERE id = ?", values)
         await db.commit()
 
+
+async def upsert_client_key(
+    server_name: str,
+    wg_pubkey: str,
+    key_name: Optional[str] = None,
+    allowed_ips: Optional[str] = None,
+    created_at: Optional[str] = None,
+    connected: bool = False,
+    last_handshake: int = 0,
+    rx_bytes: int = 0,
+    tx_bytes: int = 0,
+    endpoint: Optional[str] = None,
+    active: bool = True,
+    client_id: Optional[int] = None,
+    payer: Optional[bool] = None,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO client_keys (
+                server_name, wg_pubkey, key_name, allowed_ips, created_at,
+                connected, last_handshake, rx_bytes, tx_bytes, endpoint,
+                active, payer, client_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                server_name,
+                wg_pubkey,
+                key_name,
+                allowed_ips,
+                created_at,
+                1 if connected else 0,
+                int(last_handshake or 0),
+                int(rx_bytes or 0),
+                int(tx_bytes or 0),
+                endpoint,
+                1 if active else 0,
+                1 if payer is not None and payer else 1,
+                client_id,
+            ),
+        )
+
+        await db.execute(
+            """
+            UPDATE client_keys
+            SET key_name = COALESCE(?, key_name),
+                allowed_ips = COALESCE(?, allowed_ips),
+                created_at = COALESCE(created_at, ?),
+                connected = ?,
+                last_handshake = ?,
+                rx_bytes = ?,
+                tx_bytes = ?,
+                endpoint = COALESCE(?, endpoint),
+                active = ?
+            WHERE server_name = ? AND wg_pubkey = ?
+            """,
+            (
+                key_name,
+                allowed_ips,
+                created_at,
+                1 if connected else 0,
+                int(last_handshake or 0),
+                int(rx_bytes or 0),
+                int(tx_bytes or 0),
+                endpoint,
+                1 if active else 0,
+                server_name,
+                wg_pubkey,
+            ),
+        )
+
+        if client_id is not None:
+            await db.execute(
+                "UPDATE client_keys SET client_id = ? WHERE server_name = ? AND wg_pubkey = ?",
+                (client_id, server_name, wg_pubkey),
+            )
+        if payer is not None:
+            await db.execute(
+                "UPDATE client_keys SET payer = ? WHERE server_name = ? AND wg_pubkey = ?",
+                (1 if payer else 0, server_name, wg_pubkey),
+            )
+
+        async with db.execute(
+            "SELECT id FROM client_keys WHERE server_name = ? AND wg_pubkey = ?",
+            (server_name, wg_pubkey),
+        ) as cur:
+            row = await cur.fetchone()
+
+        await db.commit()
+        return int(row[0])
+
+
+async def sync_server_keys(server_name: str, peers: List[Dict]) -> Dict[str, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT wg_pubkey FROM client_keys WHERE server_name = ?",
+            (server_name,),
+        ) as cur:
+            existing = {r["wg_pubkey"] for r in await cur.fetchall()}
+
+        incoming = set()
+        added = 0
+
+        for p in peers:
+            pubkey = p.get("pubkey")
+            if not pubkey:
+                continue
+            incoming.add(pubkey)
+            if pubkey not in existing:
+                added += 1
+
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO client_keys (
+                    server_name, wg_pubkey, key_name, allowed_ips, created_at,
+                    connected, last_handshake, rx_bytes, tx_bytes, endpoint,
+                    active, payer
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)
+                """,
+                (
+                    server_name,
+                    pubkey,
+                    p.get("name"),
+                    p.get("ip"),
+                    p.get("created"),
+                    1 if p.get("connected") else 0,
+                    int(p.get("last_handshake") or 0),
+                    int(p.get("rx_bytes") or 0),
+                    int(p.get("tx_bytes") or 0),
+                    p.get("endpoint"),
+                ),
+            )
+
+            await db.execute(
+                """
+                UPDATE client_keys
+                SET key_name = COALESCE(?, key_name),
+                    allowed_ips = COALESCE(?, allowed_ips),
+                    created_at = COALESCE(created_at, ?),
+                    connected = ?,
+                    last_handshake = ?,
+                    rx_bytes = ?,
+                    tx_bytes = ?,
+                    endpoint = COALESCE(?, endpoint),
+                    active = 1
+                WHERE server_name = ? AND wg_pubkey = ?
+                """,
+                (
+                    p.get("name"),
+                    p.get("ip"),
+                    p.get("created"),
+                    1 if p.get("connected") else 0,
+                    int(p.get("last_handshake") or 0),
+                    int(p.get("rx_bytes") or 0),
+                    int(p.get("tx_bytes") or 0),
+                    p.get("endpoint"),
+                    server_name,
+                    pubkey,
+                ),
+            )
+
+        if incoming:
+            placeholders = ",".join("?" for _ in incoming)
+            params = [server_name, *incoming]
+            await db.execute(
+                f"UPDATE client_keys SET active = 0, connected = 0 WHERE server_name = ? AND wg_pubkey NOT IN ({placeholders})",
+                params,
+            )
+            async with db.execute(
+                f"SELECT COUNT(*) FROM client_keys WHERE server_name = ? AND wg_pubkey NOT IN ({placeholders})",
+                params,
+            ) as cur:
+                inactive = int((await cur.fetchone())[0])
+        else:
+            await db.execute(
+                "UPDATE client_keys SET active = 0, connected = 0 WHERE server_name = ?",
+                (server_name,),
+            )
+            async with db.execute(
+                "SELECT COUNT(*) FROM client_keys WHERE server_name = ?",
+                (server_name,),
+            ) as cur:
+                inactive = int((await cur.fetchone())[0])
+
+        await db.commit()
+
+    return {"total": len(incoming), "added": added, "inactive": inactive}
+
+
+async def get_client_keys(client_id: int) -> List[ClientKey]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM client_keys
+            WHERE client_id = ?
+            ORDER BY active DESC, key_name COLLATE NOCASE, id
+            """,
+            (client_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_client_key(r) for r in rows]
+
+
+async def get_unlinked_keys() -> List[ClientKey]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM client_keys
+            WHERE client_id IS NULL
+            ORDER BY active DESC, key_name COLLATE NOCASE, id
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_client_key(r) for r in rows]
+
+
+async def get_key_by_id(key_id: int) -> Optional[ClientKey]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM client_keys WHERE id = ?", (key_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_client_key(row) if row else None
+
+
+async def assign_key_to_client(key_id: int, client_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE client_keys SET client_id = ? WHERE id = ?", (client_id, key_id))
+        await db.commit()
+
+
+async def unassign_key(key_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE client_keys SET client_id = NULL WHERE id = ?", (key_id,))
+        await db.commit()
+
+
+async def set_key_payer(key_id: int, payer: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE client_keys SET payer = ? WHERE id = ?", (1 if payer else 0, key_id))
+        await db.commit()
+
+
+async def delete_client_record(client_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE client_keys SET client_id = NULL WHERE client_id = ?", (client_id,))
+        await db.execute("DELETE FROM clients WHERE id = ?", (client_id,))
+        await db.commit()
+
+
+async def get_payment_waiting_clients() -> List[Client]:
+    return await _fetch_clients("WHERE c.payment_status = 'waiting_confirm'")
+
+
 def _row_to_client(row) -> Client:
+    key_count = int(row["key_count"] or 0) if "key_count" in row.keys() else 0
+    payable_key_count = int(row["payable_key_count"] or 0) if "payable_key_count" in row.keys() else 0
+    nonpayable = max(0, key_count - payable_key_count)
+
+    devices = _calc_devices(key_count, int(row["devices"] or 0))
+    monthly_fee = _calc_monthly_fee(payable_key_count, float(row["monthly_fee"] or 0))
+
     return Client(
         id=row["id"],
         telegram_id=row["telegram_id"],
         name=row["name"],
         username=row["username"],
         server_name=row["server_name"],
-        devices=row["devices"],
-        monthly_fee=row["monthly_fee"],
+        devices=devices,
+        monthly_fee=monthly_fee,
         active=bool(row["active"]),
         payment_status=row["payment_status"],
         payment_date=row["payment_date"],
@@ -177,4 +605,27 @@ def _row_to_client(row) -> Client:
         disconnect_date=row["disconnect_date"],
         wg_pubkey=row["wg_pubkey"],
         wg_peer_id=row["wg_peer_id"],
+        paid_until=row["paid_until"] if "paid_until" in row.keys() else None,
+        key_count=key_count,
+        payable_key_count=payable_key_count,
+        nonpayable_key_count=nonpayable,
+    )
+
+
+def _row_to_client_key(row) -> ClientKey:
+    return ClientKey(
+        id=row["id"],
+        server_name=row["server_name"],
+        wg_pubkey=row["wg_pubkey"],
+        key_name=row["key_name"],
+        allowed_ips=row["allowed_ips"],
+        created_at=row["created_at"],
+        connected=bool(row["connected"]),
+        last_handshake=int(row["last_handshake"] or 0),
+        rx_bytes=int(row["rx_bytes"] or 0),
+        tx_bytes=int(row["tx_bytes"] or 0),
+        endpoint=row["endpoint"],
+        active=bool(row["active"]),
+        payer=bool(row["payer"]),
+        client_id=row["client_id"],
     )

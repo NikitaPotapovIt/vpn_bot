@@ -20,15 +20,32 @@ from apscheduler.triggers.cron import CronTrigger
 
 from database import (
     get_active_clients, update_payment_status, increment_reminder_day,
-    set_disconnect_date, set_client_active, log_payment, reset_monthly_payments
+    set_disconnect_date, set_client_active, log_payment, reset_monthly_payments,
+    get_client_keys,
 )
 from ssh_manager import disable_peer
-from config import ADMIN_IDS
+from config import ADMIN_IDS, DEVICE_MONTHLY_PRICE
 
 logger = logging.getLogger(__name__)
 
 # Будет установлен при инициализации
 _bot = None
+
+
+def _parse_date(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _is_paid_now(client, today=None) -> bool:
+    if today is None:
+        today = datetime.now().date()
+    paid_until = _parse_date(client.paid_until)
+    return bool(paid_until and paid_until >= today)
 
 def init_scheduler(bot) -> AsyncIOScheduler:
     global _bot
@@ -52,7 +69,15 @@ async def monthly_reset_and_notify():
     """1-е число: сбрасываем статусы и шлём напоминания"""
     await reset_monthly_payments()
     clients = await get_active_clients()
+    due_clients = []
     for client in clients:
+        if client.monthly_fee <= 0:
+            continue
+        if _is_paid_now(client):
+            continue
+        if client.payment_status == "waiting_confirm":
+            continue
+        due_clients.append(client)
         try:
             await _bot.send_message(
                 client.telegram_id,
@@ -73,7 +98,7 @@ async def monthly_reset_and_notify():
             await _bot.send_message(
                 admin_id,
                 f"📅 <b>Начало расчётного периода</b>\n"
-                f"Разослано напоминаний: {len(clients)} клиентам",
+                f"Разослано напоминаний: {len(due_clients)} клиентам",
                 parse_mode="HTML"
             )
         except Exception:
@@ -86,8 +111,13 @@ async def daily_reminder_check():
     if today == 1:
         return
     
+    today_date = datetime.now().date()
     clients = await get_active_clients()
     for client in clients:
+        if client.monthly_fee <= 0:
+            continue
+        if _is_paid_now(client, today_date):
+            continue
         if client.payment_status in ("paid", "waiting_confirm"):
             continue
         
@@ -126,15 +156,31 @@ async def disconnect_check():
     """Отключаем клиентов с истёкшей датой отключения"""
     from database import get_all_clients
     today = datetime.now().strftime("%Y-%m-%d")
+    today_date = datetime.now().date()
     clients = await get_all_clients()
     
     for client in clients:
+        if client.monthly_fee <= 0:
+            continue
+        if _is_paid_now(client, today_date):
+            continue
         if (client.active and client.disconnect_date and 
                 client.disconnect_date <= today and
                 client.payment_status not in ("paid", "waiting_confirm")):
             
             # Отключаем peer на сервере
-            if client.wg_pubkey:
+            keys = await get_client_keys(client.id)
+            if keys:
+                failures = 0
+                for key in keys:
+                    try:
+                        ok = await disable_peer(key.server_name, key.wg_pubkey)
+                        if not ok:
+                            failures += 1
+                    except Exception:
+                        failures += 1
+                success = failures == 0
+            elif client.wg_pubkey:
                 success = await disable_peer(client.server_name, client.wg_pubkey)
             else:
                 success = True  # нет ключа — просто меняем статус
@@ -174,10 +220,15 @@ def _paid_button(client_id: int):
 async def notify_payment_claimed(bot, client):
     """Уведомляем администратора, что клиент сообщил об оплате"""
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_pay:{client.id}"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_pay:{client.id}"),
-    ]])
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_pay:{client.id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_pay:{client.id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
+        ],
+    ])
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
@@ -185,8 +236,9 @@ async def notify_payment_claimed(bot, client):
                 f"💳 <b>Заявка на оплату</b>\n\n"
                 f"Клиент: <b>{client.name}</b> (@{client.username})\n"
                 f"Сервер: {client.server_name}\n"
-                f"Сумма: {client.monthly_fee:.0f} ₽\n"
-                f"Устройств: {client.devices}",
+                f"Платных ключей: {client.payable_key_count}\n"
+                f"Тариф: {DEVICE_MONTHLY_PRICE:.0f} ₽/устройство\n"
+                f"Сумма за месяц: {client.monthly_fee:.0f} ₽",
                 parse_mode="HTML",
                 reply_markup=kb
             )

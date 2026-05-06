@@ -6,6 +6,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "17070698").split(",")))
+DEVICE_MONTHLY_PRICE = float(os.getenv("DEVICE_MONTHLY_PRICE", "100"))
 
 @dataclass
 class ServerConfig:

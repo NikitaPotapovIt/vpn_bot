@@ -9,9 +9,35 @@ from database import get_client_by_tg, update_payment_status
 from scheduler import notify_payment_claimed
 from config import ADMIN_IDS
 import logging
+from datetime import datetime, date
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+def _parse_date(value: str):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _status_human(client) -> str:
+    if client.monthly_fee <= 0:
+        return "🚫 Оплата не требуется"
+    paid_until = _parse_date(client.paid_until)
+    if paid_until and paid_until >= date.today():
+        return f"✅ Оплачено до {paid_until.strftime('%d.%m.%Y')}"
+    if client.payment_status == "paid":
+        return "⏳ Ожидает продления"
+    return {
+        "paid": "✅ Оплачено",
+        "pending": "⏳ Ожидает оплаты",
+        "waiting_confirm": "🔄 Проверяется",
+        "overdue": "🔴 Просрочено",
+    }.get(client.payment_status, client.payment_status)
 
 def client_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -29,12 +55,7 @@ async def cmd_start(msg: Message):
 
     client = await get_client_by_tg(msg.from_user.id)
     if client:
-        status_text = {
-            "paid": "✅ Оплачено",
-            "pending": "⏳ Ожидает оплаты",
-            "waiting_confirm": "🔄 Проверяется",
-            "overdue": "🔴 Просрочено",
-        }.get(client.payment_status, client.payment_status)
+        status_text = _status_human(client)
 
         await msg.answer(
             f"👋 <b>Привет, {client.name}!</b>\n\n"
@@ -63,9 +84,15 @@ async def cmd_status(msg: Message):
 
     active = "🟢 активен" if client.active else "🔴 отключён"
     disc = f"\n⚠️ Плановое отключение: {client.disconnect_date}" if client.disconnect_date else ""
+    paid_until = _parse_date(client.paid_until)
+    paid_line = f"\n📅 Оплачено до: {paid_until.strftime('%d.%m.%Y')}" if paid_until else ""
 
     kb = None
-    if client.payment_status in ("pending", "overdue"):
+    needs_payment = client.monthly_fee > 0 and (
+        client.payment_status in ("pending", "overdue")
+        or (client.payment_status == "paid" and (not paid_until or paid_until < date.today()))
+    )
+    if needs_payment:
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{client.id}")
         ]])
@@ -74,7 +101,8 @@ async def cmd_status(msg: Message):
         f"📊 <b>Статус подписки</b>\n\n"
         f"Сервер: {client.server_name}\n"
         f"VPN: {active}\n"
-        f"Оплата: {client.payment_status}"
+        f"Оплата: {_status_human(client)}"
+        f"{paid_line}"
         f"{disc}",
         parse_mode="HTML",
         reply_markup=kb or client_kb()

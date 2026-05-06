@@ -35,6 +35,10 @@ async def ssh_exec(server_name: str, command: str) -> Tuple[str, str, int]:
 def _docker(cmd: str) -> str:
     return f"docker exec amnezia-awg {cmd}"
 
+
+def _sh_single_quote(command: str) -> str:
+    return "'" + command.replace("'", "'\"'\"'") + "'"
+
 def _local_exec(command: str) -> Tuple[str, str, int]:
     import subprocess
     result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
@@ -94,6 +98,7 @@ async def get_wg_dump(server_name: str) -> Dict[str, Dict]:
             last_hs = int(parts[4]) if parts[4] != "0" else 0
             result[pubkey] = {
                 "endpoint": parts[2],
+                "allowed_ips": parts[3] if len(parts) > 3 else "",
                 "last_handshake": last_hs,
                 "rx_bytes": int(parts[5]),
                 "tx_bytes": int(parts[6]),
@@ -115,23 +120,52 @@ async def get_peer_status(server_name: str, pubkey: str) -> Dict:
 async def get_all_peers_merged(server_name: str) -> List[Dict]:
     clients = await get_clients_table(server_name)
     dump = await get_wg_dump(server_name)
-    result = []
+    result_map: Dict[str, Dict] = {}
+
     for c in clients:
-        pubkey = c["clientId"]
-        data = c["userData"]
+        pubkey = c.get("clientId")
+        if not pubkey:
+            continue
+        data = c.get("userData", {})
         wg = dump.get(pubkey, {})
-        result.append({
+        rx_bytes = int(wg.get("rx_bytes", 0))
+        tx_bytes = int(wg.get("tx_bytes", 0))
+        result_map[pubkey] = {
             "pubkey": pubkey,
             "name": data.get("clientName", "Unknown"),
-            "ip": data.get("allowedIps", "—"),
+            "ip": data.get("allowedIps") or wg.get("allowed_ips") or "—",
             "created": data.get("creationDate", "—"),
             "connected": wg.get("connected", False),
-            "last_handshake": wg.get("last_handshake", 0),
-            "rx_mb": round(wg.get("rx_bytes", 0) / 1_048_576, 2),
-            "tx_mb": round(wg.get("tx_bytes", 0) / 1_048_576, 2),
+            "last_handshake": int(wg.get("last_handshake", 0)),
+            "rx_bytes": rx_bytes,
+            "tx_bytes": tx_bytes,
+            "rx_mb": round(rx_bytes / 1_048_576, 2),
+            "tx_mb": round(tx_bytes / 1_048_576, 2),
             "endpoint": wg.get("endpoint", "—"),
-        })
-    return result
+        }
+
+    # Некоторые ключи могут существовать в dump, но отсутствовать в clientsTable
+    for pubkey, wg in dump.items():
+        if pubkey in result_map:
+            continue
+        rx_bytes = int(wg.get("rx_bytes", 0))
+        tx_bytes = int(wg.get("tx_bytes", 0))
+        result_map[pubkey] = {
+            "pubkey": pubkey,
+            "name": f"Imported-{pubkey[:6]}",
+            "ip": wg.get("allowed_ips") or "—",
+            "created": "—",
+            "connected": wg.get("connected", False),
+            "last_handshake": int(wg.get("last_handshake", 0)),
+            "rx_bytes": rx_bytes,
+            "tx_bytes": tx_bytes,
+            "rx_mb": round(rx_bytes / 1_048_576, 2),
+            "tx_mb": round(tx_bytes / 1_048_576, 2),
+            "endpoint": wg.get("endpoint", "—"),
+        }
+
+    # Стабильная сортировка по имени, затем по ключу
+    return sorted(result_map.values(), key=lambda p: ((p.get("name") or "").lower(), p["pubkey"]))
 
 # ─── Пинг и скорость ──────────────────────────────────────────────────────────
 
@@ -144,38 +178,113 @@ async def ping_server(server_name: str) -> Dict:
     avg_ms = float(match.group(1)) if match else None
     return {"success": code == 0, "ms": avg_ms, "host": server.host, "name": server_name}
 
-async def speed_test(server_name: str) -> Dict:
-    # Попытка 1: speedtest-cli
-    out, _, code = await _exec(server_name, "which speedtest-cli 2>/dev/null || which speedtest 2>/dev/null")
+async def _exec_in_context(server_name: str, cmd: str, context: str) -> Tuple[str, str, int]:
+    if context == "vpn":
+        wrapped = _docker(f"sh -lc {_sh_single_quote(cmd)}")
+        return await _exec(server_name, wrapped)
+    return await _exec(server_name, cmd)
+
+
+def _parse_speedtest_simple(output: str) -> Dict:
+    data = {}
+    for line in output.splitlines():
+        if "Ping:" in line:
+            m = re.search(r"([\d.]+)\s*ms", line)
+            if m:
+                data["ping_ms"] = float(m.group(1))
+        elif "Download:" in line:
+            m = re.search(r"([\d.]+)\s*Mbit", line)
+            if m:
+                data["download_mbps"] = float(m.group(1))
+        elif "Upload:" in line:
+            m = re.search(r"([\d.]+)\s*Mbit", line)
+            if m:
+                data["upload_mbps"] = float(m.group(1))
+    return data
+
+
+def _parse_wget_download(output: str) -> Optional[float]:
+    match = re.search(r"([\d.]+)\s*([KMG])b(?:it)?/s", output)
+    if not match:
+        return None
+    val = float(match.group(1))
+    unit = match.group(2)
+    mbps = val / 1000 if unit == "K" else (val * 1000 if unit == "G" else val)
+    return round(mbps, 1)
+
+
+def _parse_curl_download_bps(output: str) -> Optional[float]:
+    m = re.search(r"speed_bps=([\d.]+)", output)
+    if not m:
+        return None
+    bytes_per_sec = float(m.group(1))
+    # bytes/s -> mbit/s
+    return round((bytes_per_sec * 8) / 1_000_000, 1)
+
+
+async def _speed_test_ctx(server_name: str, context: str) -> Dict:
+    location = "vpn-container" if context == "vpn" else "host"
+    binary_cmd = "command -v speedtest-cli 2>/dev/null || command -v speedtest 2>/dev/null"
+    out, _, code = await _exec_in_context(server_name, binary_cmd, context)
     if code == 0 and out.strip():
         binary = out.strip().splitlines()[0]
-        result_out, _, code2 = await _exec(server_name, f"{binary} --simple 2>&1")
+        result_out, _, code2 = await _exec_in_context(server_name, f"{binary} --simple 2>&1", context)
         if code2 == 0:
-            data = {}
-            for line in result_out.splitlines():
-                if "Ping:" in line:
-                    m = re.search(r"([\d.]+)\s*ms", line)
-                    if m: data["ping_ms"] = float(m.group(1))
-                elif "Download:" in line:
-                    m = re.search(r"([\d.]+)\s*Mbit", line)
-                    if m: data["download_mbps"] = float(m.group(1))
-                elif "Upload:" in line:
-                    m = re.search(r"([\d.]+)\s*Mbit", line)
-                    if m: data["upload_mbps"] = float(m.group(1))
+            data = _parse_speedtest_simple(result_out)
             if data:
-                return {"success": True, "method": "speedtest-cli", **data}
+                return {"success": True, "context": location, "method": "speedtest-cli", **data}
 
-    # Попытка 2: wget
-    cmd = "wget -O /dev/null --report-speed=bits https://speed.hetzner.de/10MB.bin 2>&1 | tail -5"
-    out, _, code = await _exec(server_name, cmd)
-    match = re.search(r"([\d.]+)\s*([KMG])b(?:it)?/s", out)
-    if match:
-        val = float(match.group(1))
-        unit = match.group(2)
-        mbps = val / 1000 if unit == "K" else (val * 1000 if unit == "G" else val)
-        return {"success": True, "method": "wget", "download_mbps": round(mbps, 1)}
+    # Попытка 2: wget (download only)
+    wget_cmd = "wget -O /dev/null --report-speed=bits https://speed.hetzner.de/10MB.bin 2>&1 | tail -5"
+    out, _, _ = await _exec_in_context(server_name, wget_cmd, context)
+    mbps = _parse_wget_download(out)
+    if mbps is not None:
+        return {"success": True, "context": location, "method": "wget", "download_mbps": mbps}
 
-    return {"success": False, "error": "speedtest-cli не установлен. Установи: apt install speedtest-cli"}
+    # Попытка 3: curl (download only)
+    curl_cmd = "curl -L -o /dev/null -s -w 'speed_bps=%{speed_download}\\n' https://speed.hetzner.de/10MB.bin"
+    out, _, _ = await _exec_in_context(server_name, curl_cmd, context)
+    mbps = _parse_curl_download_bps(out)
+    if mbps is not None:
+        return {"success": True, "context": location, "method": "curl", "download_mbps": mbps}
+
+    return {
+        "success": False,
+        "context": location,
+        "error": "Не найден speedtest/wget/curl в выбранном контуре",
+    }
+
+
+async def speed_test_host(server_name: str) -> Dict:
+    return await _speed_test_ctx(server_name, "host")
+
+
+async def speed_test_vpn(server_name: str) -> Dict:
+    return await _speed_test_ctx(server_name, "vpn")
+
+
+async def speed_test(server_name: str) -> Dict:
+    """Совместимость со старым API: тест хоста."""
+    return await speed_test_host(server_name)
+
+
+async def speed_test_both(server_name: str) -> Dict:
+    host = await speed_test_host(server_name)
+    vpn = await speed_test_vpn(server_name)
+    return {"host": host, "vpn": vpn}
+
+
+async def reboot_server(server_name: str) -> Dict:
+    server = _get_server(server_name)
+    if not server:
+        return {"success": False, "error": f"Server '{server_name}' not found"}
+
+    # Возвращает управление сразу, перезагрузка происходит спустя несколько секунд.
+    cmd = "nohup sh -c 'sleep 2 && reboot' >/dev/null 2>&1 &"
+    _, err, code = await _exec(server_name, cmd)
+    if code == 0:
+        return {"success": True}
+    return {"success": False, "error": err or "не удалось запланировать reboot"}
 
 # ─── Управление peer'ами ──────────────────────────────────────────────────────
 
