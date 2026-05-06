@@ -47,6 +47,16 @@ def _is_paid_now(client, today=None) -> bool:
     paid_until = _parse_date(client.paid_until)
     return bool(paid_until and paid_until >= today)
 
+
+async def _servers_line(client) -> str:
+    keys = await get_client_keys(client.id)
+    servers = sorted({k.server_name for k in keys if k.active})
+    if not servers:
+        servers = [client.server_name]
+    if len(servers) == 1:
+        return f"🖥 Сервер: {servers[0]}"
+    return f"🖥 Серверы: {', '.join(servers)}"
+
 def init_scheduler(bot) -> AsyncIOScheduler:
     global _bot
     _bot = bot
@@ -79,12 +89,13 @@ async def monthly_reset_and_notify():
             continue
         due_clients.append(client)
         try:
+            servers_line = await _servers_line(client)
             await _bot.send_message(
                 client.telegram_id,
                 f"👋 <b>Привет, {client.name}!</b>\n\n"
                 f"Наступило 1-е число — время оплаты VPN.\n"
                 f"💰 Сумма: <b>{client.monthly_fee:.0f} ₽</b> (устройств: {client.devices})\n"
-                f"🖥 Сервер: {client.server_name}\n\n"
+                f"{servers_line}\n\n"
                 f"Нажми кнопку ниже, когда переведёшь оплату:",
                 parse_mode="HTML",
                 reply_markup=_paid_button(client.id)
@@ -125,11 +136,13 @@ async def daily_reminder_check():
         day = client.reminder_day + 1  # уже инкрементировали
         
         try:
+            servers_line = await _servers_line(client)
             if day == 2:
                 await _bot.send_message(
                     client.telegram_id,
                     f"⚠️ <b>{client.name}</b>, напоминаю об оплате VPN.\n\n"
                     f"💰 Сумма: <b>{client.monthly_fee:.0f} ₽</b>\n"
+                    f"{servers_line}\n"
                     f"Пожалуйста, оплати и нажми кнопку:",
                     parse_mode="HTML",
                     reply_markup=_paid_button(client.id)
@@ -142,7 +155,8 @@ async def daily_reminder_check():
                         f"🚨 <b>Последнее предупреждение, {client.name}!</b>\n\n"
                         f"Оплата не поступила. Если не оплатишь в течение "
                         f"<b>{days_left} дн.</b> — VPN будет отключён.\n\n"
-                        f"💰 Сумма: <b>{client.monthly_fee:.0f} ₽</b>",
+                        f"💰 Сумма: <b>{client.monthly_fee:.0f} ₽</b>\n"
+                        f"{servers_line}",
                         parse_mode="HTML",
                         reply_markup=_paid_button(client.id)
                     )
