@@ -34,6 +34,7 @@ from database import (
     get_client_keys,
     get_unlinked_keys,
     get_key_by_id,
+    upsert_client_key,
     assign_key_to_client,
     unassign_key,
     set_key_payer,
@@ -600,6 +601,7 @@ async def client_keys(cb: CallbackQuery):
             "Импортируй peer'ы и привяжи ключи."
         )
         kb = _with_home([
+            [InlineKeyboardButton(text="🆕 Создать ключ на сервере", callback_data=f"create_key_pick_server:{client_id}")],
             [InlineKeyboardButton(text="➕ Привязать ключ", callback_data=f"link_key_pick:{client_id}:0")],
             [InlineKeyboardButton(text="◀️ К клиенту", callback_data=f"client_card:{client_id}")],
         ])
@@ -623,10 +625,124 @@ async def client_keys(cb: CallbackQuery):
             InlineKeyboardButton(text=label[:60], callback_data=f"key_card:{key.id}:{client_id}")
         ])
 
+    rows.append([InlineKeyboardButton(text="🆕 Создать ключ на сервере", callback_data=f"create_key_pick_server:{client_id}")])
     rows.append([InlineKeyboardButton(text="➕ Привязать ключ", callback_data=f"link_key_pick:{client_id}:0")])
     rows.append([InlineKeyboardButton(text="◀️ К клиенту", callback_data=f"client_card:{client_id}")])
 
     await cb.message.edit_text("\n".join(lines), parse_mode="HTML", reply_markup=_with_home(rows))
+
+
+@router.callback_query(F.data.startswith("create_key_pick_server:"))
+async def create_key_pick_server(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    client_id = int(cb.data.split(":")[1])
+    client = await get_client_by_id(client_id)
+    if not client:
+        await cb.answer("Клиент не найден")
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=f"🖥 {s.name}", callback_data=f"create_key_do:{client_id}:{s.name}")]
+        for s in SERVERS
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ К ключам", callback_data=f"client_keys:{client_id}")])
+
+    await cb.message.edit_text(
+        (
+            f"<b>🆕 Создание нового ключа</b>\n\n"
+            f"Клиент: <b>{client.name}</b>\n"
+            f"Выбери сервер, где создать ключ:"
+        ),
+        parse_mode="HTML",
+        reply_markup=_with_home(rows),
+    )
+
+
+@router.callback_query(F.data.startswith("create_key_do:"))
+async def create_key_do(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    _, client_id_str, server_name = cb.data.split(":", 2)
+    client_id = int(client_id_str)
+    client = await get_client_by_id(client_id)
+    if not client:
+        await cb.answer("Клиент не найден")
+        return
+
+    peer_name = f"{client.name}_{datetime.now().strftime('%d%m_%H%M')}"
+    await cb.message.edit_text(f"⏳ Создаю ключ для <b>{client.name}</b> на сервере <b>{server_name}</b>...", parse_mode="HTML")
+    wg_data = await add_peer(server_name, peer_name)
+    if not wg_data:
+        await cb.message.edit_text(
+            f"❌ Не удалось создать ключ на сервере {server_name}.",
+            reply_markup=_with_home([[InlineKeyboardButton(text="◀️ К ключам", callback_data=f"client_keys:{client_id}")]]),
+        )
+        return
+
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    await upsert_client_key(
+        server_name=server_name,
+        wg_pubkey=wg_data["pubkey"],
+        key_name=peer_name,
+        allowed_ips=wg_data["client_ip"],
+        created_at=created_at,
+        connected=False,
+        last_handshake=0,
+        rx_bytes=0,
+        tx_bytes=0,
+        endpoint="",
+        active=True,
+        payer=True,
+        client_id=client_id,
+    )
+
+    file_name = f"vpn_client{client.id}_{server_name}_{datetime.now().strftime('%Y%m%d_%H%M')}.conf"
+    admin_config = io.BytesIO(wg_data["config_text"].encode())
+    admin_config.name = file_name
+    await cb.message.answer_document(
+        admin_config,
+        caption=(
+            f"🔑 Новый ключ для <b>{client.name}</b>\n"
+            f"Сервер: {server_name}\n"
+            f"IP: {wg_data['client_ip']}"
+        ),
+        parse_mode="HTML",
+    )
+
+    delivered_to_client = False
+    try:
+        client_config = io.BytesIO(wg_data["config_text"].encode())
+        client_config.name = file_name
+        await cb.bot.send_document(
+            client.telegram_id,
+            client_config,
+            caption=(
+                f"🔑 <b>Твой новый VPN-ключ</b>\n"
+                f"Сервер: {server_name}\n"
+                f"IP: {wg_data['client_ip']}\n"
+                f"Название: {peer_name}"
+            ),
+            parse_mode="HTML",
+        )
+        delivered_to_client = True
+    except Exception:
+        logger.exception("failed to send new key to client %s", client.id)
+
+    delivery_text = "и клиенту" if delivered_to_client else "клиенту не доставлен (проверь, писал ли он боту)"
+    await cb.message.edit_text(
+        (
+            f"✅ Ключ создан и отправлен админу.\n"
+            f"Отправка клиенту: <b>{delivery_text}</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=_with_home([
+            [InlineKeyboardButton(text="🔑 Ключи клиента", callback_data=f"client_keys:{client_id}")],
+            [InlineKeyboardButton(text="👤 Карточка клиента", callback_data=f"client_card:{client_id}")],
+        ]),
+    )
 
 
 @router.callback_query(F.data.startswith("key_card:"))
