@@ -1,5 +1,6 @@
 """Обработчики администратора: клиенты, серверы, ключи и оплаты"""
 
+import asyncio
 import io
 import calendar
 import logging
@@ -35,12 +36,14 @@ from database import (
     get_unlinked_keys,
     get_linkable_keys,
     get_key_by_id,
+    get_key_by_server_pubkey,
     get_key_access_clients,
     is_key_linked_to_client,
     is_key_linked_any,
     upsert_client_key,
     assign_key_to_client,
     unassign_key,
+    delete_key_record,
     set_key_payer,
     set_key_billing_client,
     delete_client_record,
@@ -61,6 +64,7 @@ from ssh_manager import (
 
 router = Router()
 logger = logging.getLogger(__name__)
+CLIENT_KEY_MESSAGE_TTL_SEC = 3600
 
 
 # ─── Общие помощники ──────────────────────────────────────────────────────────
@@ -91,6 +95,53 @@ def _with_home(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=rows + [[InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")]]
     )
+
+
+async def _delete_message_later(bot, chat_id: int, message_id: int, delay_sec: int = CLIENT_KEY_MESSAGE_TTL_SEC):
+    await asyncio.sleep(delay_sec)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        # Сообщение могли удалить вручную или бот мог потерять доступ.
+        pass
+
+
+async def _notify_client_key_deleted(bot, client_id: int, key_name: str, server_name: str):
+    client = await get_client_by_id(client_id)
+    if not client:
+        return False
+    try:
+        await bot.send_message(
+            client.telegram_id,
+            (
+                "❌ <b>VPN-ключ удалён администратором</b>\n\n"
+                f"Название: <b>{key_name}</b>\n"
+                f"Сервер: {server_name}"
+            ),
+            parse_mode="HTML",
+        )
+        return True
+    except Exception:
+        logger.exception("failed to notify key deletion for client %s", client_id)
+        return False
+
+
+async def _notify_client_key_unlinked(bot, client_id: int, key_name: str, server_name: str):
+    client = await get_client_by_id(client_id)
+    if not client:
+        return
+    try:
+        await bot.send_message(
+            client.telegram_id,
+            (
+                "ℹ️ <b>Доступ к VPN-ключу отключён</b>\n\n"
+                f"Название: <b>{key_name}</b>\n"
+                f"Сервер: {server_name}"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("failed to notify key unlink for client %s", client_id)
 
 
 def _parse_date(value: Optional[str]) -> Optional[date]:
@@ -711,6 +762,7 @@ async def create_key_do(cb: CallbackQuery):
         admin_config,
         caption=(
             f"🔑 Новый ключ для <b>{client.name}</b>\n"
+            f"Название ключа: <b>{peer_name}</b>\n"
             f"Сервер: {server_name}\n"
             f"IP: {wg_data['client_ip']}"
         ),
@@ -721,25 +773,41 @@ async def create_key_do(cb: CallbackQuery):
     try:
         client_config = io.BytesIO(wg_data["config_text"].encode())
         client_config.name = file_name
-        await cb.bot.send_document(
+        sent_msg = await cb.bot.send_document(
             client.telegram_id,
             client_config,
             caption=(
                 f"🔑 <b>Твой новый VPN-ключ</b>\n"
+                f"Название: <b>{peer_name}</b>\n"
                 f"Сервер: {server_name}\n"
                 f"IP: {wg_data['client_ip']}\n"
-                f"Название: {peer_name}"
+                "⚠️ Сообщение с конфигом будет удалено через 1 час."
             ),
             parse_mode="HTML",
+        )
+        asyncio.create_task(
+            _delete_message_later(
+                cb.bot,
+                chat_id=client.telegram_id,
+                message_id=sent_msg.message_id,
+                delay_sec=CLIENT_KEY_MESSAGE_TTL_SEC,
+            )
         )
         delivered_to_client = True
     except Exception:
         logger.exception("failed to send new key to client %s", client.id)
 
-    delivery_text = "и клиенту" if delivered_to_client else "клиенту не доставлен (проверь, писал ли он боту)"
+    delivery_text = (
+        "доставлен (сообщение удалится через 1 час)"
+        if delivered_to_client
+        else "не доставлен (проверь, писал ли он боту)"
+    )
     await cb.message.edit_text(
         (
-            f"✅ Ключ создан и отправлен админу.\n"
+            "✅ Ключ создан.\n"
+            f"Название: <b>{peer_name}</b>\n"
+            f"Сервер: <b>{server_name}</b>\n"
+            f"IP: <b>{wg_data['client_ip']}</b>\n\n"
             f"Отправка клиенту: <b>{delivery_text}</b>"
         ),
         parse_mode="HTML",
@@ -807,6 +875,10 @@ async def key_card(cb: CallbackQuery):
             text="👤 Назначить плательщиком этого клиента",
             callback_data=f"key_set_billing:{key.id}:{client_id}",
         )])
+    rows.append([InlineKeyboardButton(
+        text="🗑 Удалить ключ с сервера",
+        callback_data=f"key_remove_ask:{key.id}:{client_id}",
+    )])
     rows.append([InlineKeyboardButton(text="◀️ К ключам", callback_data=f"client_keys:{client_id}")])
 
     kb = _with_home(rows)
@@ -863,9 +935,13 @@ async def key_unlink(cb: CallbackQuery):
     _, key_id_str, client_id_str = cb.data.split(":")
     key_id = int(key_id_str)
     client_id = int(client_id_str)
+    key = await get_key_by_id(key_id)
+    key_name = (key.key_name if key and key.key_name else f"key-{key_id}")
+    key_server = (key.server_name if key else "—")
 
     await unassign_key(key_id, client_id)
     key_still_linked = await is_key_linked_any(key_id)
+    await _notify_client_key_unlinked(cb.bot, client_id, key_name, key_server)
     await cb.answer("Ключ отвязан")
     await cb.message.edit_text(
         "✅ Доступ клиента к ключу удалён."
@@ -875,6 +951,93 @@ async def key_unlink(cb: CallbackQuery):
             [InlineKeyboardButton(text="🧩 Непривязанные ключи", callback_data="show_unlinked_info")],
         ]),
     )
+
+
+@router.callback_query(F.data.startswith("key_remove_ask:"))
+async def key_remove_ask(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    _, key_id_str, client_id_str = cb.data.split(":")
+    key_id = int(key_id_str)
+    client_id = int(client_id_str)
+
+    key = await get_key_by_id(key_id)
+    if not key:
+        await cb.answer("Ключ не найден")
+        return
+
+    key_name = key.key_name or key.wg_pubkey[:8]
+    await cb.message.edit_text(
+        (
+            "⚠️ <b>Удаление ключа</b>\n\n"
+            f"Ключ: <b>{key_name}</b>\n"
+            f"Сервер: <b>{key.server_name}</b>\n"
+            f"IP: <b>{key.allowed_ips or '—'}</b>\n\n"
+            "Ключ будет удалён с сервера и из базы.\n"
+            "Все связанные клиенты получат уведомление.\n\n"
+            "Продолжить?"
+        ),
+        parse_mode="HTML",
+        reply_markup=_with_home([
+            [
+                InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"key_remove_do:{key_id}:{client_id}"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"key_card:{key_id}:{client_id}"),
+            ]
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("key_remove_do:"))
+async def key_remove_do(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    _, key_id_str, client_id_str = cb.data.split(":")
+    key_id = int(key_id_str)
+    client_id = int(client_id_str)
+
+    key = await get_key_by_id(key_id)
+    if not key:
+        await cb.answer("Ключ не найден")
+        return
+
+    key_name = key.key_name or key.wg_pubkey[:8]
+    linked_clients = await get_key_access_clients(key_id)
+
+    ok = await remove_peer(key.server_name, key.wg_pubkey)
+    if not ok:
+        await cb.message.edit_text(
+            "❌ Не удалось удалить ключ на сервере.",
+            reply_markup=_with_home([
+                [InlineKeyboardButton(text="◀️ К ключам", callback_data=f"client_keys:{client_id}")],
+                [InlineKeyboardButton(text="🔁 Открыть ключ", callback_data=f"key_card:{key_id}:{client_id}")],
+            ]),
+        )
+        return
+
+    await delete_key_record(key_id)
+
+    notified = 0
+    for linked in linked_clients:
+        if await _notify_client_key_deleted(cb.bot, linked.client_id, key_name, key.server_name):
+            notified += 1
+
+    await cb.message.edit_text(
+        (
+            "✅ Ключ удалён.\n\n"
+            f"Название: <b>{key_name}</b>\n"
+            f"Сервер: <b>{key.server_name}</b>\n"
+            f"Уведомлено клиентов: <b>{notified}/{len(linked_clients)}</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=_with_home([
+            [InlineKeyboardButton(text="◀️ К ключам клиента", callback_data=f"client_keys:{client_id}")],
+            [InlineKeyboardButton(text="🧩 Непривязанные ключи", callback_data="show_unlinked_info")],
+        ]),
+    )
+    await cb.answer("Ключ удалён")
 
 
 @router.callback_query(F.data.startswith("link_key_pick:"))
@@ -1750,8 +1913,16 @@ async def remove_peer_manual(cb: CallbackQuery):
         return
 
     _, server_name, pubkey = cb.data.split(":", 2)
+    db_key = await get_key_by_server_pubkey(server_name, pubkey)
+    linked_clients = await get_key_access_clients(db_key.id) if db_key else []
+    key_name = db_key.key_name if db_key and db_key.key_name else pubkey[:8]
+
     ok = await remove_peer(server_name, pubkey)
     if ok:
+        if db_key:
+            await delete_key_record(db_key.id)
+            for linked in linked_clients:
+                await _notify_client_key_deleted(cb.bot, linked.client_id, key_name, server_name)
         await cb.answer("Peer удалён")
     else:
         await cb.answer("Не удалось удалить peer")

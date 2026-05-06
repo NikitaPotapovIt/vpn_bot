@@ -39,6 +39,119 @@ def _docker(cmd: str) -> str:
 def _sh_single_quote(command: str) -> str:
     return "'" + command.replace("'", "'\"'\"'") + "'"
 
+
+def _extract_awg_params(wg_show_out: str, conf_out: str) -> Dict[str, int]:
+    conf_names = {
+        "jc": "Jc",
+        "jmin": "Jmin",
+        "jmax": "Jmax",
+        "s1": "S1",
+        "s2": "S2",
+        "h1": "H1",
+        "h2": "H2",
+        "h3": "H3",
+        "h4": "H4",
+    }
+    params: Dict[str, int] = {}
+    for key in ("jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4"):
+        m = re.search(rf"^\s*{key}\s*:\s*(\d+)\s*$", wg_show_out, flags=re.MULTILINE)
+        if m:
+            params[key] = int(m.group(1))
+            continue
+        conf_key = conf_names[key]
+        m = re.search(rf"^\s*{conf_key}\s*=\s*(\d+)\s*$", conf_out, flags=re.MULTILINE)
+        if m:
+            params[key] = int(m.group(1))
+    return params
+
+
+def _awg_params_text(params: Dict[str, int]) -> str:
+    if not params.get("jc"):
+        return ""
+    return (
+        f"Jc = {params.get('jc', 0)}\n"
+        f"Jmin = {params.get('jmin', 50)}\n"
+        f"Jmax = {params.get('jmax', 1000)}\n"
+        f"S1 = {params.get('s1', 0)}\n"
+        f"S2 = {params.get('s2', 0)}\n"
+        f"H1 = {params.get('h1', 1)}\n"
+        f"H2 = {params.get('h2', 2)}\n"
+        f"H3 = {params.get('h3', 3)}\n"
+        f"H4 = {params.get('h4', 4)}\n"
+    )
+
+
+def _build_awg_restore_cmd(params: Dict[str, int]) -> str:
+    if not params.get("jc"):
+        return ""
+    return (
+        "wg set wg0 "
+        f"jc {params.get('jc', 0)} "
+        f"jmin {params.get('jmin', 50)} "
+        f"jmax {params.get('jmax', 1000)} "
+        f"s1 {params.get('s1', 0)} "
+        f"s2 {params.get('s2', 0)} "
+        f"h1 {params.get('h1', 1)} "
+        f"h2 {params.get('h2', 2)} "
+        f"h3 {params.get('h3', 3)} "
+        f"h4 {params.get('h4', 4)}"
+    )
+
+
+def _append_peer_to_conf_text(
+    conf_text: str,
+    client_name: str,
+    pubkey: str,
+    psk: str,
+    client_ip: str,
+) -> str:
+    safe_name = client_name.replace("\r", " ").replace("\n", " ")
+    block = (
+        "[Peer]\n"
+        f"# {safe_name}\n"
+        f"PublicKey = {pubkey}\n"
+        f"PresharedKey = {psk}\n"
+        f"AllowedIPs = {client_ip}\n"
+    )
+    base = conf_text.rstrip()
+    if base:
+        return base + "\n\n" + block + "\n"
+    return block + "\n"
+
+
+def _remove_peer_from_conf_text(conf_text: str, pubkey: str) -> Tuple[str, bool]:
+    lines = conf_text.splitlines()
+    out_lines: List[str] = []
+    i = 0
+    removed = False
+
+    while i < len(lines):
+        if lines[i].strip() != "[Peer]":
+            out_lines.append(lines[i])
+            i += 1
+            continue
+
+        block: List[str] = [lines[i]]
+        i += 1
+        while i < len(lines) and lines[i].strip() != "[Peer]":
+            block.append(lines[i])
+            i += 1
+
+        is_target = False
+        for ln in block:
+            normalized = re.sub(r"\s+", "", ln)
+            if normalized == f"PublicKey={pubkey}":
+                is_target = True
+                break
+
+        if is_target:
+            removed = True
+            continue
+        out_lines.extend(block)
+
+    result = "\n".join(out_lines).rstrip() + "\n"
+    return result, removed
+
 def _local_exec(command: str) -> Tuple[str, str, int]:
     import subprocess
     result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
@@ -53,6 +166,42 @@ async def _exec(server_name: str, command: str) -> Tuple[str, str, int]:
     if server and server.is_local:
         return await local_exec(command)
     return await ssh_exec(server_name, command)
+
+
+async def _read_awg_file(server_name: str, path: str) -> Optional[str]:
+    out, _, code = await _exec(server_name, _docker(f"cat {path}"))
+    if code != 0:
+        return None
+    return out
+
+
+async def _write_awg_file(server_name: str, path: str, content: str, mode: str = "600") -> bool:
+    write_cmd = (
+        f"cat > {path} <<'CFGEOF'\n"
+        f"{content}"
+        "CFGEOF\n"
+        f"chmod {mode} {path}"
+    )
+    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(write_cmd)}"))
+    return code == 0
+
+
+async def _load_clients_table_strict(server_name: str) -> Optional[List[Dict]]:
+    raw = await _read_awg_file(server_name, "/opt/amnezia/awg/clientsTable")
+    if raw is None:
+        return []
+    if not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+async def _write_clients_table(server_name: str, table: List[Dict]) -> bool:
+    payload = json.dumps(table, indent=4, ensure_ascii=False) + "\n"
+    return await _write_awg_file(server_name, "/opt/amnezia/awg/clientsTable", payload, mode="644")
 
 # ─── Мониторинг ───────────────────────────────────────────────────────────────
 
@@ -80,13 +229,8 @@ async def get_server_status(server_name: str) -> Dict:
         return {"name": server_name, "host": server.host, "online": False, "error": str(e)}
 
 async def get_clients_table(server_name: str) -> List[Dict]:
-    out, _, code = await _exec(server_name, _docker("cat /opt/amnezia/awg/clientsTable"))
-    if code != 0 or not out:
-        return []
-    try:
-        return json.loads(out)
-    except Exception:
-        return []
+    table = await _load_clients_table_strict(server_name)
+    return table if table is not None else []
 
 async def get_wg_dump(server_name: str) -> Dict[str, Dict]:
     out, _, _ = await _exec(server_name, _docker("wg show wg0 dump"))
@@ -357,7 +501,9 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     psk_out, _, _ = await _exec(server_name, _docker("wg genpsk"))
     psk = psk_out.strip()
 
-    conf_out, _, _ = await _exec(server_name, _docker("cat /opt/amnezia/awg/wg0.conf"))
+    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    if conf_out is None:
+        return None
     used_ips = set(int(x) for x in re.findall(r"AllowedIPs\s*=\s*10\.8\.1\.(\d+)", conf_out))
     next_num = next(i for i in range(2, 255) if i not in used_ips)
     client_ip = f"10.8.1.{next_num}/32"
@@ -366,88 +512,50 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     server_pubkey = server_pub_out.strip()
 
     wg_show_out, _, _ = await _exec(server_name, _docker("wg show wg0"))
-    jc = re.search(r"jc:\s*(\d+)", wg_show_out)
-    jmin = re.search(r"jmin:\s*(\d+)", wg_show_out)
-    jmax = re.search(r"jmax:\s*(\d+)", wg_show_out)
-    s1 = re.search(r"s1:\s*(\d+)", wg_show_out)
-    s2 = re.search(r"s2:\s*(\d+)", wg_show_out)
+    awg_params = _extract_awg_params(wg_show_out, conf_out)
     port_match = re.search(r"listening port:\s*(\d+)", wg_show_out)
     port = port_match.group(1) if port_match else "46742"
 
-    # Добавляем peer:
-    # 1) Надёжно дописываем блок в wg0.conf (без literal "\n" из echo в разных sh).
-    # 2) Пытаемся применить к живому wg0; если интерфейс сейчас не поднят, конфиг всё равно сохранится.
-    safe_client_name = client_name.replace("\n", " ").replace("\r", " ")
-    peer_lines = [
-        "[Peer]",
-        f"# {safe_client_name}",
-        f"PublicKey = {pubkey}",
-        f"PresharedKey = {psk}",
-        f"AllowedIPs = {client_ip}",
-        "",
-    ]
-    append_peer_cmd = (
-        "printf '%s\\n' "
-        + " ".join(_sh_single_quote(line) for line in peer_lines)
-        + " >> /opt/amnezia/awg/wg0.conf"
-    )
-    _, _, append_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(append_peer_cmd)}"))
-    if append_code != 0:
+    conf_new = _append_peer_to_conf_text(conf_out, client_name, pubkey, psk, client_ip)
+    if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
         return None
 
-    awg_restore_cmd = ""
-    if jc:
-        awg_restore_cmd = (
-            f"wg set wg0 "
-            f"jc {jc.group(1)} "
-            f"jmin {jmin.group(1) if jmin else 50} "
-            f"jmax {jmax.group(1) if jmax else 1000} "
-            f"s1 {s1.group(1) if s1 else 0} "
-            f"s2 {s2.group(1) if s2 else 0} "
-            f"h1 1 h2 2 h3 3 h4 4"
-        )
+    awg_restore_cmd = _build_awg_restore_cmd(awg_params)
 
     runtime_apply_cmd = (
         f"tmp_psk=$(mktemp) && "
         f"printf '%s' {_sh_single_quote(psk)} > \"$tmp_psk\" && "
         f"wg set wg0 peer {pubkey} preshared-key \"$tmp_psk\" allowed-ips {client_ip}; "
         f"rc=$?; "
-        + (f"if [ $rc -eq 0 ]; then {awg_restore_cmd}; fi; " if awg_restore_cmd else "")
+        + (
+            f"if [ $rc -eq 0 ] && ! ({awg_restore_cmd}); then rc=1; fi; "
+            if awg_restore_cmd else ""
+        )
         + f"rm -f \"$tmp_psk\"; exit $rc"
     )
-    await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
+    _, _, apply_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
+    if apply_code != 0:
+        # Если runtime-применение не удалось, откатываем файл конфига.
+        await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_out, mode="600")
+        return None
 
-    # Обновляем clientsTable
+    # Обновляем clientsTable (при повреждении файла не перетираем его).
     import datetime
-    table = await get_clients_table(server_name)
-    table.append({
-        "clientId": pubkey,
-        "userData": {
-            "allowedIps": client_ip,
-            "clientName": client_name,
-            "creationDate": datetime.datetime.now().strftime("%a %b %-d %H:%M:%S %Y"),
-        }
-    })
-    table_json = json.dumps(table, indent=4, ensure_ascii=False)
-    write_table_cmd = (
-        "cat > /opt/amnezia/awg/clientsTable <<'JSONEOF'\n"
-        f"{table_json}\n"
-        "JSONEOF\n"
-        "chmod 644 /opt/amnezia/awg/clientsTable"
-    )
-    await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(write_table_cmd)}"))
+    table = await _load_clients_table_strict(server_name)
+    if table is not None:
+        table = [c for c in table if c.get("clientId") != pubkey]
+        table.append({
+            "clientId": pubkey,
+            "userData": {
+                "allowedIps": client_ip,
+                "clientName": client_name,
+                "creationDate": datetime.datetime.now().strftime("%a %b %-d %H:%M:%S %Y"),
+            }
+        })
+        await _write_clients_table(server_name, table)
 
     server = _get_server(server_name)
-    amnezia_params = ""
-    if jc:
-        amnezia_params = (
-            f"Jc = {jc.group(1)}\n"
-            f"Jmin = {jmin.group(1) if jmin else 50}\n"
-            f"Jmax = {jmax.group(1) if jmax else 1000}\n"
-            f"S1 = {s1.group(1) if s1 else 0}\n"
-            f"S2 = {s2.group(1) if s2 else 0}\n"
-            f"H1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\n"
-        )
+    amnezia_params = _awg_params_text(awg_params)
 
     client_config = (
         f"[Interface]\nPrivateKey = {privkey}\nAddress = {client_ip}\nDNS = 1.1.1.1\n"
@@ -459,17 +567,21 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
             "config_text": client_config, "server_name": server_name}
 
 async def remove_peer(server_name: str, pubkey: str) -> bool:
-    await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
-    escaped = re.escape(pubkey).replace("/", "\\/")
-    await _exec(server_name,
-        f"docker exec amnezia-awg sh -c 'sed -i \"/{escaped}/,/^$/d\" /opt/amnezia/awg/wg0.conf'"
-    )
-    table = await get_clients_table(server_name)
-    table = [c for c in table if c["clientId"] != pubkey]
-    table_json = json.dumps(table, indent=4, ensure_ascii=False)
-    await _exec(server_name,
-        f"docker exec amnezia-awg sh -c 'cat > /opt/amnezia/awg/clientsTable' << 'JSONEOF'\n{table_json}\nJSONEOF"
-    )
+    _, _, code = await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
+    if code != 0:
+        return False
+
+    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    if conf_out is None:
+        return False
+    conf_new, _ = _remove_peer_from_conf_text(conf_out, pubkey)
+    if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
+        return False
+
+    table = await _load_clients_table_strict(server_name)
+    if table is not None:
+        table = [c for c in table if c.get("clientId") != pubkey]
+        await _write_clients_table(server_name, table)
     return True
 
 async def disable_peer(server_name: str, pubkey: str) -> bool:

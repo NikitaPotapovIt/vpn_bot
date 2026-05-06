@@ -662,6 +662,15 @@ async def get_key_by_id(key_id: int) -> Optional[ClientKey]:
     return _row_to_client_key(row) if row else None
 
 
+async def get_key_by_server_pubkey(server_name: str, wg_pubkey: str) -> Optional[ClientKey]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = _key_select_sql("WHERE k.server_name = ? AND k.wg_pubkey = ?")
+        async with db.execute(query, (server_name, wg_pubkey)) as cur:
+            row = await cur.fetchone()
+    return _row_to_client_key(row) if row else None
+
+
 async def get_key_access_clients(key_id: int) -> List[KeyAccessClient]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
@@ -726,6 +735,14 @@ async def unassign_key(key_id: int, client_id: Optional[int] = None):
             (key_id, client_id),
         )
         await db.execute("UPDATE client_keys SET client_id = billing_client_id WHERE id = ?", (key_id,))
+        await db.commit()
+
+
+async def delete_key_record(key_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("DELETE FROM key_access WHERE key_id = ?", (key_id,))
+        await db.execute("DELETE FROM client_keys WHERE id = ?", (key_id,))
         await db.commit()
 
 
