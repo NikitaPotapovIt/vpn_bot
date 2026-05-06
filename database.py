@@ -45,11 +45,23 @@ class ClientKey:
     endpoint: Optional[str]
     active: bool
     payer: bool
-    client_id: Optional[int]
+    client_id: Optional[int]  # legacy column (kept for compatibility)
+    billing_client_id: Optional[int]
+    billing_client_name: Optional[str] = None
+    linked_clients: int = 0
 
 
-def _calc_monthly_fee(payable_devices: int, fallback_fee: float) -> float:
-    if payable_devices > 0:
+@dataclass
+class KeyAccessClient:
+    client_id: int
+    name: str
+    username: Optional[str]
+
+
+def _calc_monthly_fee(key_count: int, payable_devices: int, fallback_fee: float) -> float:
+    # Если у клиента уже есть связанные ключи, считаем строго по платным ключам.
+    # Fallback нужен только для legacy-записей без ключей.
+    if key_count > 0:
         return float(payable_devices * DEVICE_MONTHLY_PRICE)
     return float(fallback_fee)
 
@@ -64,6 +76,22 @@ async def _get_columns(db: aiosqlite.Connection, table_name: str) -> List[str]:
     async with db.execute(f"PRAGMA table_info({table_name})") as cur:
         rows = await cur.fetchall()
     return [r[1] for r in rows]
+
+
+async def _get_key_id(db: aiosqlite.Connection, server_name: str, wg_pubkey: str) -> Optional[int]:
+    async with db.execute(
+        "SELECT id FROM client_keys WHERE server_name = ? AND wg_pubkey = ?",
+        (server_name, wg_pubkey),
+    ) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else None
+
+
+async def _ensure_key_access(db: aiosqlite.Connection, key_id: int, client_id: int):
+    await db.execute(
+        "INSERT OR IGNORE INTO key_access (key_id, client_id) VALUES (?, ?)",
+        (key_id, client_id),
+    )
 
 
 async def init_db():
@@ -109,8 +137,22 @@ async def init_db():
                 active INTEGER DEFAULT 1,
                 payer INTEGER DEFAULT 1,
                 client_id INTEGER,
+                billing_client_id INTEGER,
                 UNIQUE(server_name, wg_pubkey),
-                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE SET NULL
+                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE SET NULL,
+                FOREIGN KEY (billing_client_id) REFERENCES clients(id) ON DELETE SET NULL
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS key_access (
+                key_id INTEGER NOT NULL,
+                client_id INTEGER NOT NULL,
+                PRIMARY KEY (key_id, client_id),
+                FOREIGN KEY (key_id) REFERENCES client_keys(id) ON DELETE CASCADE,
+                FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
             )
             """
         )
@@ -128,15 +170,21 @@ async def init_db():
             """
         )
 
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_client_id ON client_keys(client_id)")
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_server ON client_keys(server_name)")
-
-        # Миграция старых баз
+        # Миграции старых баз
         client_columns = await _get_columns(db, "clients")
         if "paid_until" not in client_columns:
             await db.execute("ALTER TABLE clients ADD COLUMN paid_until TEXT")
 
-        # Перенос legacy-полей wg_pubkey/wg_peer_id в новую таблицу ключей
+        key_columns = await _get_columns(db, "client_keys")
+        if "billing_client_id" not in key_columns:
+            await db.execute("ALTER TABLE client_keys ADD COLUMN billing_client_id INTEGER")
+
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_client_id ON client_keys(client_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_billing_client_id ON client_keys(billing_client_id)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_server ON client_keys(server_name)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_key_access_client_id ON key_access(client_id)")
+
+        # Перенос legacy-полей wg_pubkey/wg_peer_id в таблицу ключей
         async with db.execute(
             "SELECT id, server_name, name, active, wg_pubkey, wg_peer_id FROM clients WHERE wg_pubkey IS NOT NULL AND wg_pubkey != ''"
         ) as cur:
@@ -147,11 +195,41 @@ async def init_db():
             await db.execute(
                 """
                 INSERT OR IGNORE INTO client_keys (
-                    server_name, wg_pubkey, key_name, allowed_ips, active, payer, client_id
-                ) VALUES (?, ?, ?, ?, ?, 1, ?)
+                    server_name, wg_pubkey, key_name, allowed_ips, active, payer, client_id, billing_client_id
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
                 """,
-                (server_name, wg_pubkey, client_name, wg_peer_id, 1 if active else 0, client_id),
+                (server_name, wg_pubkey, client_name, wg_peer_id, 1 if active else 0, client_id, client_id),
             )
+
+        # Миграция client_keys.client_id -> key_access
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO key_access (key_id, client_id)
+            SELECT id, client_id
+            FROM client_keys
+            WHERE client_id IS NOT NULL
+            """
+        )
+
+        # Заполнить billing_client_id где возможно
+        await db.execute(
+            """
+            UPDATE client_keys
+            SET billing_client_id = client_id
+            WHERE billing_client_id IS NULL AND client_id IS NOT NULL
+            """
+        )
+
+        await db.execute(
+            """
+            UPDATE client_keys
+            SET billing_client_id = (
+                SELECT ka.client_id FROM key_access ka WHERE ka.key_id = client_keys.id LIMIT 1
+            )
+            WHERE billing_client_id IS NULL
+              AND EXISTS (SELECT 1 FROM key_access ka2 WHERE ka2.key_id = client_keys.id)
+            """
+        )
 
         await db.commit()
 
@@ -183,19 +261,26 @@ async def add_client(
             await db.execute(
                 """
                 INSERT OR IGNORE INTO client_keys (
-                    server_name, wg_pubkey, key_name, allowed_ips, active, payer, client_id
-                ) VALUES (?, ?, ?, ?, 1, 1, ?)
+                    server_name, wg_pubkey, key_name, allowed_ips, active, payer, client_id, billing_client_id
+                ) VALUES (?, ?, ?, ?, 1, 1, ?, ?)
                 """,
-                (server_name, wg_pubkey, name, wg_peer_id, client_id),
+                (server_name, wg_pubkey, name, wg_peer_id, client_id, client_id),
             )
             await db.execute(
                 """
                 UPDATE client_keys
-                SET client_id = ?, key_name = COALESCE(key_name, ?), allowed_ips = COALESCE(allowed_ips, ?)
+                SET key_name = COALESCE(key_name, ?),
+                    allowed_ips = COALESCE(allowed_ips, ?),
+                    billing_client_id = COALESCE(billing_client_id, ?),
+                    client_id = COALESCE(client_id, ?)
                 WHERE server_name = ? AND wg_pubkey = ?
                 """,
-                (client_id, name, wg_peer_id, server_name, wg_pubkey),
+                (name, wg_peer_id, client_id, client_id, server_name, wg_pubkey),
             )
+
+            key_id = await _get_key_id(db, server_name, wg_pubkey)
+            if key_id:
+                await _ensure_key_access(db, key_id, client_id)
 
         await db.commit()
         return client_id
@@ -205,10 +290,11 @@ async def _fetch_clients(where_sql: str = "", params: tuple = ()) -> List[Client
     query = f"""
         SELECT
             c.*,
-            COALESCE(COUNT(k.id), 0) AS key_count,
-            COALESCE(SUM(CASE WHEN k.payer = 1 THEN 1 ELSE 0 END), 0) AS payable_key_count
+            COALESCE(COUNT(DISTINCT k.id), 0) AS key_count,
+            COALESCE(COUNT(DISTINCT CASE WHEN k.payer = 1 AND k.billing_client_id = c.id THEN k.id END), 0) AS payable_key_count
         FROM clients c
-        LEFT JOIN client_keys k ON k.client_id = c.id AND k.active = 1
+        LEFT JOIN key_access ka ON ka.client_id = c.id
+        LEFT JOIN client_keys k ON k.id = ka.key_id AND k.active = 1
         {where_sql}
         GROUP BY c.id
         ORDER BY c.name
@@ -341,6 +427,7 @@ async def upsert_client_key(
     active: bool = True,
     client_id: Optional[int] = None,
     payer: Optional[bool] = None,
+    billing_client_id: Optional[int] = None,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -348,8 +435,8 @@ async def upsert_client_key(
             INSERT OR IGNORE INTO client_keys (
                 server_name, wg_pubkey, key_name, allowed_ips, created_at,
                 connected, last_handshake, rx_bytes, tx_bytes, endpoint,
-                active, payer, client_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                active, payer, client_id, billing_client_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 server_name,
@@ -365,6 +452,7 @@ async def upsert_client_key(
                 1 if active else 0,
                 1 if payer is not None and payer else 1,
                 client_id,
+                billing_client_id if billing_client_id is not None else client_id,
             ),
         )
 
@@ -397,25 +485,32 @@ async def upsert_client_key(
             ),
         )
 
+        key_id = await _get_key_id(db, server_name, wg_pubkey)
+        if key_id is None:
+            await db.commit()
+            raise RuntimeError("Failed to read key id after upsert")
+
         if client_id is not None:
+            await _ensure_key_access(db, key_id, client_id)
             await db.execute(
-                "UPDATE client_keys SET client_id = ? WHERE server_name = ? AND wg_pubkey = ?",
-                (client_id, server_name, wg_pubkey),
-            )
-        if payer is not None:
-            await db.execute(
-                "UPDATE client_keys SET payer = ? WHERE server_name = ? AND wg_pubkey = ?",
-                (1 if payer else 0, server_name, wg_pubkey),
+                "UPDATE client_keys SET client_id = COALESCE(client_id, ?) WHERE id = ?",
+                (client_id, key_id),
             )
 
-        async with db.execute(
-            "SELECT id FROM client_keys WHERE server_name = ? AND wg_pubkey = ?",
-            (server_name, wg_pubkey),
-        ) as cur:
-            row = await cur.fetchone()
+        if payer is not None:
+            await db.execute("UPDATE client_keys SET payer = ? WHERE id = ?", (1 if payer else 0, key_id))
+
+        if billing_client_id is not None:
+            await _ensure_key_access(db, key_id, billing_client_id)
+            await db.execute("UPDATE client_keys SET billing_client_id = ?, client_id = ? WHERE id = ?", (billing_client_id, billing_client_id, key_id))
+        elif client_id is not None:
+            await db.execute(
+                "UPDATE client_keys SET billing_client_id = COALESCE(billing_client_id, ?) WHERE id = ?",
+                (client_id, key_id),
+            )
 
         await db.commit()
-        return int(row[0])
+        return key_id
 
 
 async def sync_server_keys(server_name: str, peers: List[Dict]) -> Dict[str, int]:
@@ -516,17 +611,24 @@ async def sync_server_keys(server_name: str, peers: List[Dict]) -> Dict[str, int
     return {"total": len(incoming), "added": added, "inactive": inactive}
 
 
+def _key_select_sql(where_clause: str) -> str:
+    return f"""
+        SELECT
+            k.*,
+            b.name AS billing_client_name,
+            (SELECT COUNT(*) FROM key_access ka2 WHERE ka2.key_id = k.id) AS linked_clients
+        FROM client_keys k
+        LEFT JOIN clients b ON b.id = k.billing_client_id
+        {where_clause}
+        ORDER BY k.active DESC, k.key_name COLLATE NOCASE, k.id
+    """
+
+
 async def get_client_keys(client_id: int) -> List[ClientKey]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            """
-            SELECT * FROM client_keys
-            WHERE client_id = ?
-            ORDER BY active DESC, key_name COLLATE NOCASE, id
-            """,
-            (client_id,),
-        ) as cur:
+        query = _key_select_sql("JOIN key_access ka ON ka.key_id = k.id WHERE ka.client_id = ?")
+        async with db.execute(query, (client_id,)) as cur:
             rows = await cur.fetchall()
     return [_row_to_client_key(r) for r in rows]
 
@@ -534,13 +636,19 @@ async def get_client_keys(client_id: int) -> List[ClientKey]:
 async def get_unlinked_keys() -> List[ClientKey]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            """
-            SELECT * FROM client_keys
-            WHERE client_id IS NULL
-            ORDER BY active DESC, key_name COLLATE NOCASE, id
-            """
-        ) as cur:
+        query = _key_select_sql("WHERE NOT EXISTS (SELECT 1 FROM key_access ka WHERE ka.key_id = k.id)")
+        async with db.execute(query) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_client_key(r) for r in rows]
+
+
+async def get_linkable_keys(client_id: int) -> List[ClientKey]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = _key_select_sql(
+            "WHERE NOT EXISTS (SELECT 1 FROM key_access ka WHERE ka.key_id = k.id AND ka.client_id = ?)"
+        )
+        async with db.execute(query, (client_id,)) as cur:
             rows = await cur.fetchall()
     return [_row_to_client_key(r) for r in rows]
 
@@ -548,20 +656,76 @@ async def get_unlinked_keys() -> List[ClientKey]:
 async def get_key_by_id(key_id: int) -> Optional[ClientKey]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM client_keys WHERE id = ?", (key_id,)) as cur:
+        query = _key_select_sql("WHERE k.id = ?")
+        async with db.execute(query, (key_id,)) as cur:
             row = await cur.fetchone()
     return _row_to_client_key(row) if row else None
 
 
+async def get_key_access_clients(key_id: int) -> List[KeyAccessClient]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT c.id AS client_id, c.name, c.username
+            FROM key_access ka
+            JOIN clients c ON c.id = ka.client_id
+            WHERE ka.key_id = ?
+            ORDER BY c.name
+            """,
+            (key_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [KeyAccessClient(client_id=r["client_id"], name=r["name"], username=r["username"]) for r in rows]
+
+
+async def is_key_linked_to_client(key_id: int, client_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM key_access WHERE key_id = ? AND client_id = ? LIMIT 1",
+            (key_id, client_id),
+        ) as cur:
+            row = await cur.fetchone()
+    return row is not None
+
+
+async def is_key_linked_any(key_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM key_access WHERE key_id = ? LIMIT 1", (key_id,)) as cur:
+            row = await cur.fetchone()
+    return row is not None
+
+
 async def assign_key_to_client(key_id: int, client_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE client_keys SET client_id = ? WHERE id = ?", (client_id, key_id))
+        await _ensure_key_access(db, key_id, client_id)
+        await db.execute(
+            "UPDATE client_keys SET billing_client_id = COALESCE(billing_client_id, ?), client_id = COALESCE(client_id, ?) WHERE id = ?",
+            (client_id, client_id, key_id),
+        )
         await db.commit()
 
 
-async def unassign_key(key_id: int):
+async def unassign_key(key_id: int, client_id: Optional[int] = None):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE client_keys SET client_id = NULL WHERE id = ?", (key_id,))
+        if client_id is None:
+            await db.execute("DELETE FROM key_access WHERE key_id = ?", (key_id,))
+            await db.execute("UPDATE client_keys SET billing_client_id = NULL, client_id = NULL WHERE id = ?", (key_id,))
+            await db.commit()
+            return
+
+        await db.execute("DELETE FROM key_access WHERE key_id = ? AND client_id = ?", (key_id, client_id))
+        await db.execute(
+            """
+            UPDATE client_keys
+            SET billing_client_id = (
+                SELECT ka.client_id FROM key_access ka WHERE ka.key_id = client_keys.id LIMIT 1
+            )
+            WHERE id = ? AND billing_client_id = ?
+            """,
+            (key_id, client_id),
+        )
+        await db.execute("UPDATE client_keys SET client_id = billing_client_id WHERE id = ?", (key_id,))
         await db.commit()
 
 
@@ -571,9 +735,33 @@ async def set_key_payer(key_id: int, payer: bool):
         await db.commit()
 
 
+async def set_key_billing_client(key_id: int, client_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _ensure_key_access(db, key_id, client_id)
+        await db.execute(
+            "UPDATE client_keys SET billing_client_id = ?, client_id = ? WHERE id = ?",
+            (client_id, client_id, key_id),
+        )
+        await db.commit()
+
+
 async def delete_client_record(client_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE client_keys SET client_id = NULL WHERE client_id = ?", (client_id,))
+        await db.execute(
+            """
+            UPDATE client_keys
+            SET billing_client_id = (
+                SELECT ka.client_id
+                FROM key_access ka
+                WHERE ka.key_id = client_keys.id AND ka.client_id != ?
+                LIMIT 1
+            )
+            WHERE billing_client_id = ?
+            """,
+            (client_id, client_id),
+        )
+        await db.execute("DELETE FROM key_access WHERE client_id = ?", (client_id,))
+        await db.execute("UPDATE client_keys SET client_id = billing_client_id")
         await db.execute("DELETE FROM clients WHERE id = ?", (client_id,))
         await db.commit()
 
@@ -588,7 +776,7 @@ def _row_to_client(row) -> Client:
     nonpayable = max(0, key_count - payable_key_count)
 
     devices = _calc_devices(key_count, int(row["devices"] or 0))
-    monthly_fee = _calc_monthly_fee(payable_key_count, float(row["monthly_fee"] or 0))
+    monthly_fee = _calc_monthly_fee(key_count, payable_key_count, float(row["monthly_fee"] or 0))
 
     return Client(
         id=row["id"],
@@ -627,5 +815,8 @@ def _row_to_client_key(row) -> ClientKey:
         endpoint=row["endpoint"],
         active=bool(row["active"]),
         payer=bool(row["payer"]),
-        client_id=row["client_id"],
+        client_id=row["client_id"] if "client_id" in row.keys() else None,
+        billing_client_id=row["billing_client_id"] if "billing_client_id" in row.keys() else None,
+        billing_client_name=row["billing_client_name"] if "billing_client_name" in row.keys() else None,
+        linked_clients=int(row["linked_clients"] or 0) if "linked_clients" in row.keys() else 0,
     )

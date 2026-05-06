@@ -96,6 +96,7 @@ async def monthly_reset_and_notify():
                 f"Наступило 1-е число — время оплаты VPN.\n"
                 f"💰 Сумма: <b>{client.monthly_fee:.0f} ₽</b> (устройств: {client.devices})\n"
                 f"{servers_line}\n\n"
+                f"Перевод на карту T-Bank, по номеру +79625700040\n\n"
                 f"Нажми кнопку ниже, когда переведёшь оплату:",
                 parse_mode="HTML",
                 reply_markup=_paid_button(client.id)
@@ -185,8 +186,14 @@ async def disconnect_check():
             # Отключаем peer на сервере
             keys = await get_client_keys(client.id)
             if keys:
+                # Отключаем только те ключи, за которые отвечает этот плательщик.
+                # Иначе можно затронуть shared-ключи, оплачиваемые другим клиентом.
+                keys_to_disable = [k for k in keys if k.payer and k.billing_client_id == client.id]
+                if not keys_to_disable:
+                    success = True
+                    keys_to_disable = []
                 failures = 0
-                for key in keys:
+                for key in keys_to_disable:
                     try:
                         ok = await disable_peer(key.server_name, key.wg_pubkey)
                         if not ok:

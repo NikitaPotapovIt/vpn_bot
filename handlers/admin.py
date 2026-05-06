@@ -33,11 +33,16 @@ from database import (
     sync_server_keys,
     get_client_keys,
     get_unlinked_keys,
+    get_linkable_keys,
     get_key_by_id,
+    get_key_access_clients,
+    is_key_linked_to_client,
+    is_key_linked_any,
     upsert_client_key,
     assign_key_to_client,
     unassign_key,
     set_key_payer,
+    set_key_billing_client,
     delete_client_record,
 )
 from ssh_manager import (
@@ -759,8 +764,24 @@ async def key_card(cb: CallbackQuery):
         await cb.answer("Ключ не найден")
         return
 
+    if not await is_key_linked_to_client(key_id, client_id):
+        await cb.answer("У этого клиента нет доступа к ключу", show_alert=True)
+        return
+
     conn_text = "🟢 онлайн" if key.connected else f"🔴 офлайн (был: {_format_last_seen(key.last_handshake)})"
-    payer_text = "💰 Платный" if key.payer else "🚫 Неплательщик"
+    if not key.payer:
+        payer_text = "🚫 Неплательщик"
+    elif key.billing_client_id == client_id:
+        payer_text = "💰 Плательщик: этот клиент"
+    elif key.billing_client_name:
+        payer_text = f"💰 Плательщик: {key.billing_client_name}"
+    else:
+        payer_text = "💰 Плательщик не назначен"
+
+    linked_clients = await get_key_access_clients(key_id)
+    linked_names = ", ".join(c.name for c in linked_clients[:4])
+    if len(linked_clients) > 4:
+        linked_names += f" +{len(linked_clients) - 4}"
 
     text = (
         f"<b>🔑 Ключ</b>\n"
@@ -768,21 +789,27 @@ async def key_card(cb: CallbackQuery):
         f"Сервер: {key.server_name}\n"
         f"IP: {key.allowed_ips or '—'}\n"
         f"Статус: {conn_text}\n"
-        f"Тип: {payer_text}\n"
+        f"Оплата: {payer_text}\n"
+        f"Доступ у клиентов: <b>{len(linked_clients)}</b> ({linked_names or '—'})\n"
         f"RX/TX: {round(key.rx_bytes / 1_048_576, 2)} / {round(key.tx_bytes / 1_048_576, 2)} MB\n"
         f"PubKey: <code>{key.wg_pubkey}</code>"
     )
 
-    kb = _with_home([
-        [
-            InlineKeyboardButton(
-                text="🚫 Сделать неплательщиком" if key.payer else "💰 Сделать платным",
-                callback_data=f"key_toggle_payer:{key.id}:{client_id}",
-            ),
-            InlineKeyboardButton(text="🔓 Отвязать", callback_data=f"key_unlink:{key.id}:{client_id}"),
-        ],
-        [InlineKeyboardButton(text="◀️ К ключам", callback_data=f"client_keys:{client_id}")],
-    ])
+    rows = [[
+        InlineKeyboardButton(
+            text="🚫 Сделать неплательщиком" if key.payer else "💰 Сделать платным",
+            callback_data=f"key_toggle_payer:{key.id}:{client_id}",
+        ),
+        InlineKeyboardButton(text="🔓 Отвязать", callback_data=f"key_unlink:{key.id}:{client_id}"),
+    ]]
+    if key.payer and key.billing_client_id != client_id:
+        rows.append([InlineKeyboardButton(
+            text="👤 Назначить плательщиком этого клиента",
+            callback_data=f"key_set_billing:{key.id}:{client_id}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ К ключам", callback_data=f"client_keys:{client_id}")])
+
+    kb = _with_home(rows)
 
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
@@ -801,8 +828,30 @@ async def key_toggle_payer(cb: CallbackQuery):
         await cb.answer("Ключ не найден")
         return
 
-    await set_key_payer(key_id, not key.payer)
+    new_payer = not key.payer
+    await set_key_payer(key_id, new_payer)
+    if new_payer and not key.billing_client_id:
+        await set_key_billing_client(key_id, client_id)
     await cb.answer("Статус плательщика обновлён")
+    await key_card(cb)
+
+
+@router.callback_query(F.data.startswith("key_set_billing:"))
+async def key_set_billing(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    _, key_id_str, client_id_str = cb.data.split(":")
+    key_id = int(key_id_str)
+    client_id = int(client_id_str)
+
+    if not await is_key_linked_to_client(key_id, client_id):
+        await cb.answer("Сначала привяжи ключ к клиенту", show_alert=True)
+        return
+
+    await set_key_billing_client(key_id, client_id)
+    await set_key_payer(key_id, True)
+    await cb.answer("Плательщик назначен")
     await key_card(cb)
 
 
@@ -815,10 +864,12 @@ async def key_unlink(cb: CallbackQuery):
     key_id = int(key_id_str)
     client_id = int(client_id_str)
 
-    await unassign_key(key_id)
+    await unassign_key(key_id, client_id)
+    key_still_linked = await is_key_linked_any(key_id)
     await cb.answer("Ключ отвязан")
     await cb.message.edit_text(
-        "✅ Ключ отвязан от клиента.",
+        "✅ Доступ клиента к ключу удалён."
+        + ("\nКлюч всё ещё связан с другими клиентами." if key_still_linked else "\nКлюч стал непривязанным."),
         reply_markup=_with_home([
             [InlineKeyboardButton(text="◀️ К ключам клиента", callback_data=f"client_keys:{client_id}")],
             [InlineKeyboardButton(text="🧩 Непривязанные ключи", callback_data="show_unlinked_info")],
@@ -840,10 +891,10 @@ async def link_key_pick(cb: CallbackQuery):
         await cb.answer("Клиент не найден")
         return
 
-    keys = await get_unlinked_keys()
+    keys = await get_linkable_keys(client_id)
     if not keys:
         await cb.message.edit_text(
-            "🧩 Непривязанных ключей нет.",
+            "Нет доступных ключей для привязки.\n(Все ключи уже связаны с этим клиентом.)",
             reply_markup=_with_home([
                 [InlineKeyboardButton(text="◀️ К ключам", callback_data=f"client_keys:{client_id}")]
             ]),
@@ -860,7 +911,7 @@ async def link_key_pick(cb: CallbackQuery):
     lines = [
         f"<b>🔗 Привязка ключа к {client.name}</b>",
         "",
-        f"Найдено непривязанных: <b>{len(keys)}</b>",
+        f"Доступно для привязки: <b>{len(keys)}</b>",
         f"Страница: <b>{page + 1}/{total_pages}</b>",
     ]
 
@@ -868,7 +919,8 @@ async def link_key_pick(cb: CallbackQuery):
     for key in chunk:
         state = "🟢" if key.connected else "🔴"
         payer = "💰" if key.payer else "🚫"
-        label = f"{state}{payer} {key.key_name or key.wg_pubkey[:8]} | {key.server_name}"
+        linked = f"👥{key.linked_clients}" if key.linked_clients else "🧩"
+        label = f"{state}{payer}{linked} {key.key_name or key.wg_pubkey[:8]} | {key.server_name}"
         rows.append([
             InlineKeyboardButton(text=label[:60], callback_data=f"link_key_do:{client_id}:{key.id}")
         ])
@@ -896,7 +948,7 @@ async def link_key_do(cb: CallbackQuery):
     key_id = int(key_id_str)
 
     await assign_key_to_client(key_id, client_id)
-    await cb.answer("Ключ привязан")
+    await cb.answer("Доступ к ключу добавлен")
     await client_keys(cb)
 
 
@@ -1294,7 +1346,7 @@ async def create_client_from_key(cb: CallbackQuery, state: FSMContext):
     if not key:
         await cb.answer("Ключ не найден", show_alert=True)
         return
-    if key.client_id:
+    if await is_key_linked_any(key_id):
         await cb.answer("Ключ уже привязан. Обнови список.", show_alert=True)
         return
 
@@ -1450,7 +1502,7 @@ async def add_username(msg: Message, state: FSMContext):
             await state.clear()
             await msg.answer("❌ Ключ не найден. Начни снова.", reply_markup=admin_main_kb())
             return
-        if key.client_id:
+        if await is_key_linked_any(int(bind_key_id)):
             await state.clear()
             await msg.answer("❌ Ключ уже привязан к другому клиенту.", reply_markup=admin_main_kb())
             return
@@ -1538,7 +1590,7 @@ async def add_confirm(cb: CallbackQuery, state: FSMContext):
             if not key:
                 await cb.message.edit_text("❌ Ключ не найден. Попробуй снова.")
                 return
-            if key.client_id:
+            if await is_key_linked_any(bind_key_id):
                 await cb.message.edit_text("❌ Ключ уже привязан к другому клиенту.")
                 return
 
