@@ -1922,13 +1922,16 @@ async def reject_payment(cb: CallbackQuery):
     )
 
     try:
+        kb = None
+        if client.payable_key_count > 0:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{client.id}")]]
+            )
         await cb.bot.send_message(
             client.telegram_id,
             "❌ <b>Оплата не подтверждена.</b>\nПроверь перевод и нажми кнопку снова.",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{client.id}")]]
-            ),
+            reply_markup=kb,
         )
     except Exception:
         logger.exception("failed to notify rejected payment for client %s", client.id)

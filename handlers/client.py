@@ -25,7 +25,7 @@ def _parse_date(value: str):
 
 
 def _status_human(client) -> str:
-    if client.monthly_fee <= 0:
+    if not _has_payable_keys(client):
         return "🚫 Оплата не требуется"
     paid_until = _parse_date(client.paid_until)
     if paid_until and paid_until >= date.today():
@@ -39,11 +39,17 @@ def _status_human(client) -> str:
         "overdue": "🔴 Просрочено",
     }.get(client.payment_status, client.payment_status)
 
-def client_kb() -> ReplyKeyboardMarkup:
+
+def _has_payable_keys(client) -> bool:
+    return int(getattr(client, "payable_key_count", 0) or 0) > 0
+
+
+def client_kb(show_pay_button: bool = True) -> ReplyKeyboardMarkup:
+    row = [KeyboardButton(text="📊 Мой статус")]
+    if show_pay_button:
+        row.append(KeyboardButton(text="✅ Я оплатил"))
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Мой статус"), KeyboardButton(text="✅ Я оплатил")],
-        ],
+        keyboard=[row],
         resize_keyboard=True,
     )
 
@@ -56,6 +62,7 @@ async def cmd_start(msg: Message):
     client = await get_client_by_tg(msg.from_user.id)
     if client:
         status_text = _status_human(client)
+        has_payable_keys = _has_payable_keys(client)
 
         await msg.answer(
             f"👋 <b>Привет, {client.name}!</b>\n\n"
@@ -64,7 +71,7 @@ async def cmd_start(msg: Message):
             f"💰 Оплата: {client.monthly_fee:.0f} ₽/мес\n"
             f"Статус: {status_text}",
             parse_mode="HTML",
-            reply_markup=client_kb()
+            reply_markup=client_kb(show_pay_button=has_payable_keys)
         )
     else:
         await msg.answer(
@@ -86,9 +93,10 @@ async def cmd_status(msg: Message):
     disc = f"\n⚠️ Плановое отключение: {client.disconnect_date}" if client.disconnect_date else ""
     paid_until = _parse_date(client.paid_until)
     paid_line = f"\n📅 Оплачено до: {paid_until.strftime('%d.%m.%Y')}" if paid_until else ""
+    has_payable_keys = _has_payable_keys(client)
 
     kb = None
-    needs_payment = client.monthly_fee > 0 and (
+    needs_payment = has_payable_keys and (
         client.payment_status in ("pending", "overdue")
         or (client.payment_status == "paid" and (not paid_until or paid_until < date.today()))
     )
@@ -105,7 +113,7 @@ async def cmd_status(msg: Message):
         f"{paid_line}"
         f"{disc}",
         parse_mode="HTML",
-        reply_markup=kb or client_kb()
+        reply_markup=kb or client_kb(show_pay_button=has_payable_keys)
     )
 
 @router.message(F.text == "✅ Я оплатил")
@@ -128,6 +136,14 @@ async def client_paid(cb: CallbackQuery):
     await _process_paid(cb.bot, client, callback=cb)
 
 async def _process_paid(bot, client, reply=None, callback=None):
+    if not _has_payable_keys(client):
+        text = "Для этого аккаунта оплата не требуется."
+        if callback:
+            await callback.answer(text, show_alert=True)
+        else:
+            await reply.answer(text, reply_markup=client_kb(show_pay_button=False))
+        return
+
     if client.payment_status == "waiting_confirm":
         text = "Оплата уже отправлена на проверку! Ожидай подтверждения. 🔄"
         if callback:
@@ -155,5 +171,9 @@ async def _process_paid(bot, client, reply=None, callback=None):
         await callback.message.edit_text(text, parse_mode="HTML")
         await callback.answer("Заявка отправлена!")
     else:
-        await reply.answer(text, parse_mode="HTML", reply_markup=client_kb())
+        await reply.answer(
+            text,
+            parse_mode="HTML",
+            reply_markup=client_kb(show_pay_button=_has_payable_keys(client)),
+        )
         

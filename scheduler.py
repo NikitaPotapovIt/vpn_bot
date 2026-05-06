@@ -81,7 +81,7 @@ async def monthly_reset_and_notify():
     clients = await get_active_clients()
     due_clients = []
     for client in clients:
-        if client.monthly_fee <= 0:
+        if client.payable_key_count <= 0:
             continue
         if _is_paid_now(client):
             continue
@@ -126,7 +126,7 @@ async def daily_reminder_check():
     today_date = datetime.now().date()
     clients = await get_active_clients()
     for client in clients:
-        if client.monthly_fee <= 0:
+        if client.payable_key_count <= 0:
             continue
         if _is_paid_now(client, today_date):
             continue
@@ -175,7 +175,7 @@ async def disconnect_check():
     clients = await get_all_clients()
     
     for client in clients:
-        if client.monthly_fee <= 0:
+        if client.payable_key_count <= 0:
             continue
         if _is_paid_now(client, today_date):
             continue
