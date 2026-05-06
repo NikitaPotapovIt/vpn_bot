@@ -964,7 +964,9 @@ def _format_speed_result(server_name: str, result: dict, label: str) -> str:
             f"📶 Ping: {ping} мс\n"
             f"<i>метод: {method}</i>"
         )
-    return f"{label} <b>{server_name}</b>\n❌ {result.get('error', 'ошибка')}"
+    diag = result.get("diagnostic")
+    diag_line = f"\n<i>{diag}</i>" if diag else ""
+    return f"{label} <b>{server_name}</b>\n❌ {result.get('error', 'ошибка')}{diag_line}"
 
 
 @router.callback_query(F.data.startswith("speed_host:"))

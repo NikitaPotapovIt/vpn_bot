@@ -222,20 +222,38 @@ def _parse_wget_download(output: str) -> Optional[float]:
     val = float(match.group(1))
     unit = match.group(2)
     mbps = val / 1000 if unit == "K" else (val * 1000 if unit == "G" else val)
-    return round(mbps, 1)
+    mbps = round(mbps, 1)
+    return mbps if mbps > 0.1 else None
 
 
-def _parse_curl_download_bps(output: str) -> Optional[float]:
-    m = re.search(r"speed_bps=([\d.]+)", output)
-    if not m:
+def _parse_curl_metrics(output: str) -> Optional[Dict]:
+    speed_match = re.search(r"speed_bps=([\d.]+)", output)
+    size_match = re.search(r"size_bytes=([\d.]+)", output)
+    code_match = re.search(r"http_code=(\d+)", output)
+    err_match = re.search(r"err=(.*)", output)
+    if not speed_match:
         return None
-    bytes_per_sec = float(m.group(1))
-    # bytes/s -> mbit/s
-    return round((bytes_per_sec * 8) / 1_000_000, 1)
+
+    bytes_per_sec = float(speed_match.group(1))
+    size_bytes = float(size_match.group(1)) if size_match else 0.0
+    http_code = code_match.group(1) if code_match else "000"
+    err = err_match.group(1).strip() if err_match else ""
+    mbps = round((bytes_per_sec * 8) / 1_000_000, 1)
+    return {
+        "download_mbps": mbps,
+        "size_bytes": size_bytes,
+        "http_code": http_code,
+        "err": err,
+    }
 
 
 async def _speed_test_ctx(server_name: str, context: str) -> Dict:
     location = "vpn-container" if context == "vpn" else "host"
+    test_urls = [
+        "http://speed.hetzner.de/10MB.bin",
+        "http://speedtest.tele2.net/10MB.zip",
+        "http://ipv4.download.thinkbroadband.com/10MB.zip",
+    ]
     binary_cmd = "command -v speedtest-cli 2>/dev/null || command -v speedtest 2>/dev/null"
     out, _, code = await _exec_in_context(server_name, binary_cmd, context)
     if code == 0 and out.strip():
@@ -248,24 +266,47 @@ async def _speed_test_ctx(server_name: str, context: str) -> Dict:
             if data and _is_nonzero_speed_result(data):
                 return {"success": True, "context": location, "method": "speedtest-cli", **data}
 
-    # Попытка 2: wget (download only)
-    wget_cmd = "wget -O /dev/null --report-speed=bits https://speed.hetzner.de/10MB.bin 2>&1 | tail -5"
-    out, _, _ = await _exec_in_context(server_name, wget_cmd, context)
-    mbps = _parse_wget_download(out)
-    if mbps is not None:
-        return {"success": True, "context": location, "method": "wget", "download_mbps": mbps}
+    # Попытка 2: wget (download only) по нескольким URL
+    for url in test_urls:
+        wget_cmd = f"wget -O /dev/null --report-speed=bits --timeout=15 {url} 2>&1 | tail -5"
+        out, _, _ = await _exec_in_context(server_name, wget_cmd, context)
+        mbps = _parse_wget_download(out)
+        if mbps is not None:
+            return {"success": True, "context": location, "method": f"wget ({url})", "download_mbps": mbps}
 
-    # Попытка 3: curl (download only)
-    curl_cmd = "curl -L -o /dev/null -s -w 'speed_bps=%{speed_download}\\n' https://speed.hetzner.de/10MB.bin"
-    out, _, _ = await _exec_in_context(server_name, curl_cmd, context)
-    mbps = _parse_curl_download_bps(out)
-    if mbps is not None:
-        return {"success": True, "context": location, "method": "curl", "download_mbps": mbps}
+    # Попытка 3: curl (download only) по нескольким URL с валидацией size/http_code
+    last_diag = ""
+    for url in test_urls:
+        curl_cmd = (
+            "curl -L -o /dev/null -sS --connect-timeout 8 -m 45 "
+            f"-w 'speed_bps=%{{speed_download}} size_bytes=%{{size_download}} http_code=%{{http_code}} err=%{{errormsg}}\\n' {url}"
+        )
+        out, err, _ = await _exec_in_context(server_name, curl_cmd, context)
+        metrics = _parse_curl_metrics(out)
+        if metrics:
+            if (
+                metrics["download_mbps"] > 0.1
+                and metrics["size_bytes"] >= 100_000
+                and metrics["http_code"] in {"200", "206"}
+            ):
+                return {
+                    "success": True,
+                    "context": location,
+                    "method": f"curl ({url})",
+                    "download_mbps": metrics["download_mbps"],
+                }
+            last_diag = (
+                f"url={url} speed={metrics['download_mbps']} "
+                f"size={int(metrics['size_bytes'])} code={metrics['http_code']} err={metrics['err']}"
+            )
+        elif err:
+            last_diag = f"url={url} err={err}"
 
     return {
         "success": False,
         "context": location,
-        "error": "Не найден speedtest/wget/curl в выбранном контуре",
+        "error": "Не удалось измерить скорость (speedtest/wget/curl).",
+        "diagnostic": last_diag,
     }
 
 
