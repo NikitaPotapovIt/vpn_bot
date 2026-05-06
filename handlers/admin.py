@@ -769,14 +769,7 @@ async def create_key_do(cb: CallbackQuery):
         parse_mode="HTML",
     )
     if vpn_uri:
-        await cb.message.answer(
-            (
-                "🔗 <b>Ссылка для импорта в Amnezia</b>\n"
-                f"<code>{html.escape(vpn_uri)}</code>"
-            ),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
+        await cb.message.answer(vpn_uri, disable_web_page_preview=True)
 
     delivered_to_client = False
     delivered_vpn_to_client = False
@@ -809,12 +802,7 @@ async def create_key_do(cb: CallbackQuery):
         try:
             link_msg = await cb.bot.send_message(
                 client.telegram_id,
-                (
-                    "🔗 <b>Ссылка для импорта в Amnezia</b>\n"
-                    f"<code>{html.escape(vpn_uri)}</code>\n\n"
-                    "⚠️ Это сообщение удалится через 1 час."
-                ),
-                parse_mode="HTML",
+                vpn_uri,
                 disable_web_page_preview=True,
             )
             asyncio.create_task(
@@ -1838,14 +1826,7 @@ async def add_confirm(cb: CallbackQuery, state: FSMContext):
             parse_mode="HTML",
         )
         if wg_data.get("vpn_uri"):
-            await cb.message.answer(
-                (
-                    "🔗 <b>Ссылка для импорта в Amnezia</b>\n"
-                    f"<code>{html.escape(wg_data['vpn_uri'])}</code>"
-                ),
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+            await cb.message.answer(wg_data["vpn_uri"], disable_web_page_preview=True)
 
 
 # ─── Подтверждение/отклонение оплаты ─────────────────────────────────────────
