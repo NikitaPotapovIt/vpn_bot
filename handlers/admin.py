@@ -1554,32 +1554,69 @@ async def reboot_do(cb: CallbackQuery):
 # ─── Статистика ───────────────────────────────────────────────────────────────
 
 
-@router.message(F.text == "📊 Статистика")
-async def show_stats(msg: Message):
-    if not is_admin(msg.from_user.id):
-        return
+def _is_paid_now(client, today: Optional[date] = None) -> bool:
+    today = today or date.today()
+    paid_until = _parse_date(client.paid_until)
+    return bool(paid_until and paid_until >= today)
 
+
+def _stats_kb() -> InlineKeyboardMarkup:
+    return _with_home([
+        [
+            InlineKeyboardButton(text="✅ Оплатил", callback_data="stats_paid"),
+            InlineKeyboardButton(text="⏳ Не оплатил", callback_data="stats_unpaid"),
+        ],
+        [InlineKeyboardButton(text="🚫 Не плательщики", callback_data="stats_nonpayer")],
+    ])
+
+
+def _stats_back_kb() -> InlineKeyboardMarkup:
+    return _with_home([[InlineKeyboardButton(text="◀️ К статистике", callback_data="stats_back")]])
+
+
+def _stats_client_line(client) -> str:
+    username = f"@{html.escape(client.username)}" if client.username else "—"
+    paid_until = _parse_date(client.paid_until)
+    paid_until_text = paid_until.strftime("%d.%m.%Y") if paid_until else "—"
+    return (
+        f"• <b>{html.escape(client.name)}</b> | TG: <code>{client.telegram_id}</code> | {username}\n"
+        f"  {_client_status(client)} | до: {paid_until_text} | ключей: {client.key_count} ({client.payable_key_count} платн.)"
+    )
+
+
+def _stats_clients_text(title: str, clients: List) -> str:
+    if not clients:
+        return f"<b>{title}</b>\n\nСписок пуст."
+
+    lines = [f"<b>{title}</b>", f"Клиентов: <b>{len(clients)}</b>", ""]
+    lines.extend(_stats_client_line(c) for c in clients)
+    return "\n".join(lines)
+
+
+async def _stats_summary_text() -> str:
     clients = await get_all_clients()
     key_stats = await get_global_key_stats()
 
     total = len(clients)
     active = sum(1 for c in clients if c.active)
     billable_active = [c for c in clients if c.active and c.payable_key_count > 0]
-    billable_total = len(billable_active)
-    paid = sum(1 for c in billable_active if _parse_date(c.paid_until) and _parse_date(c.paid_until) >= date.today())
+    nonpayer_active = [c for c in clients if c.active and c.payable_key_count <= 0]
+
+    paid = sum(1 for c in billable_active if _is_paid_now(c))
     waiting = sum(1 for c in billable_active if c.payment_status == "waiting_confirm")
-    pending = max(0, billable_total - paid - waiting)
+    pending = max(0, len(billable_active) - paid - waiting)
 
     total_keys = key_stats["total_keys"]
     payable_keys = key_stats["payable_keys"]
     paused_keys = key_stats["paused_keys"]
     monthly = sum(c.monthly_fee for c in billable_active)
 
-    text = (
+    return (
         f"<b>📊 Статистика</b>\n\n"
         f"Всего клиентов: <b>{total}</b>\n"
         f"Активных клиентов: <b>{active}</b>\n\n"
-        f"Платящих клиентов: <b>{billable_total}</b>\n\n"
+        f"Платящих клиентов: <b>{len(billable_active)}</b>\n"
+        f"Неплательщиков: <b>{len(nonpayer_active)}</b>\n\n"
         f"🔑 Ключей всего: <b>{total_keys}</b>\n"
         f"💰 Платных ключей: <b>{payable_keys}</b>\n"
         f"⏸ Остановленных ключей: <b>{paused_keys}</b>\n"
@@ -1589,7 +1626,60 @@ async def show_stats(msg: Message):
         f"⏳ Не оплачено: <b>{pending}</b>\n\n"
         f"💰 Ожидаемый доход в месяц: <b>{monthly:.0f} ₽</b>"
     )
-    await msg.answer(text, parse_mode="HTML", reply_markup=admin_main_kb())
+
+
+@router.message(F.text == "📊 Статистика")
+async def show_stats(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+
+    text = await _stats_summary_text()
+    await msg.answer(text, parse_mode="HTML", reply_markup=_stats_kb())
+
+
+@router.callback_query(F.data == "stats_back")
+async def stats_back(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    text = await _stats_summary_text()
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=_stats_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "stats_paid")
+async def stats_paid(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    clients = await get_all_clients()
+    paid_clients = [c for c in clients if c.active and c.payable_key_count > 0 and _is_paid_now(c)]
+    paid_clients.sort(key=lambda c: c.name.lower())
+    text = _stats_clients_text("✅ Оплатил", paid_clients)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=_stats_back_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "stats_unpaid")
+async def stats_unpaid(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    clients = await get_all_clients()
+    unpaid_clients = [c for c in clients if c.active and c.payable_key_count > 0 and not _is_paid_now(c)]
+    unpaid_clients.sort(key=lambda c: c.name.lower())
+    text = _stats_clients_text("⏳ Не оплатил", unpaid_clients)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=_stats_back_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "stats_nonpayer")
+async def stats_nonpayer(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    clients = await get_all_clients()
+    nonpayer_clients = [c for c in clients if c.active and c.payable_key_count <= 0]
+    nonpayer_clients.sort(key=lambda c: c.name.lower())
+    text = _stats_clients_text("🚫 Не плательщики", nonpayer_clients)
+    await cb.message.edit_text(text, parse_mode="HTML", reply_markup=_stats_back_kb())
+    await cb.answer()
 
 
 # ─── Добавление клиента (FSM) ─────────────────────────────────────────────────
