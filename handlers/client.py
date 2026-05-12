@@ -9,7 +9,15 @@ from database import get_client_by_tg, update_payment_status
 from scheduler import notify_payment_claimed
 from config import ADMIN_IDS
 import logging
+import html
 from datetime import datetime, date
+from support_dialog import (
+    SUPPORT_CLIENT_OPEN_TEXT,
+    SUPPORT_CLOSE_TEXT,
+    open_client_dialog,
+    close_client_dialog,
+    is_client_dialog_open,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -44,14 +52,41 @@ def _has_payable_keys(client) -> bool:
     return int(getattr(client, "payable_key_count", 0) or 0) > 0
 
 
-def client_kb(show_pay_button: bool = True) -> ReplyKeyboardMarkup:
+def client_kb(show_pay_button: bool = True, support_mode: bool = False) -> ReplyKeyboardMarkup:
     row = [KeyboardButton(text="📊 Мой статус")]
     if show_pay_button:
         row.append(KeyboardButton(text="✅ Я оплатил"))
+    keyboard = [row, [KeyboardButton(text=SUPPORT_CLIENT_OPEN_TEXT)]]
+    if support_mode:
+        keyboard.append([KeyboardButton(text=SUPPORT_CLOSE_TEXT)])
     return ReplyKeyboardMarkup(
-        keyboard=[row],
+        keyboard=keyboard,
         resize_keyboard=True,
     )
+
+
+def _admin_support_kb(client_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✍️ Ответить", callback_data=f"support_reply:{client_id}"),
+        InlineKeyboardButton(text="❌ Закрыть диалог", callback_data=f"support_close:{client_id}"),
+    ]])
+
+
+async def _notify_admins_support_message(bot, client, text: str):
+    username = f"@{html.escape(client.username)}" if client.username else "—"
+    safe_text = html.escape(text.strip())[:3500]
+    payload = (
+        "💬 <b>Сообщение в поддержку</b>\n\n"
+        f"От: <b>{html.escape(client.name)}</b>\n"
+        f"TG: <code>{client.telegram_id}</code> | {username}\n\n"
+        f"{safe_text}"
+    )
+    kb = _admin_support_kb(client.id)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, payload, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            logger.exception("failed to forward support message to admin %s", admin_id)
 
 @router.message(Command("start"))
 async def cmd_start(msg: Message):
@@ -71,7 +106,10 @@ async def cmd_start(msg: Message):
             f"💰 Оплата: {client.monthly_fee:.0f} ₽/мес\n"
             f"Статус: {status_text}",
             parse_mode="HTML",
-            reply_markup=client_kb(show_pay_button=has_payable_keys)
+            reply_markup=client_kb(
+                show_pay_button=has_payable_keys,
+                support_mode=is_client_dialog_open(msg.from_user.id),
+            ),
         )
     else:
         await msg.answer(
@@ -113,7 +151,10 @@ async def cmd_status(msg: Message):
         f"{paid_line}"
         f"{disc}",
         parse_mode="HTML",
-        reply_markup=kb or client_kb(show_pay_button=has_payable_keys)
+        reply_markup=kb or client_kb(
+            show_pay_button=has_payable_keys,
+            support_mode=is_client_dialog_open(msg.from_user.id),
+        ),
     )
 
 @router.message(F.text == "✅ Я оплатил")
@@ -141,7 +182,10 @@ async def _process_paid(bot, client, reply=None, callback=None):
         if callback:
             await callback.answer(text, show_alert=True)
         else:
-            await reply.answer(text, reply_markup=client_kb(show_pay_button=False))
+            await reply.answer(
+                text,
+                reply_markup=client_kb(show_pay_button=False, support_mode=is_client_dialog_open(client.telegram_id)),
+            )
         return
 
     if client.payment_status == "waiting_confirm":
@@ -174,6 +218,89 @@ async def _process_paid(bot, client, reply=None, callback=None):
         await reply.answer(
             text,
             parse_mode="HTML",
-            reply_markup=client_kb(show_pay_button=_has_payable_keys(client)),
+            reply_markup=client_kb(
+                show_pay_button=_has_payable_keys(client),
+                support_mode=is_client_dialog_open(client.telegram_id),
+            ),
         )
-        
+
+
+@router.message(F.text == SUPPORT_CLIENT_OPEN_TEXT)
+async def open_support_dialog(msg: Message):
+    if msg.from_user.id in ADMIN_IDS:
+        return
+    client = await get_client_by_tg(msg.from_user.id)
+    if not client:
+        await msg.answer("❌ Ты не зарегистрирован.")
+        return
+
+    already_open = is_client_dialog_open(client.telegram_id)
+    open_client_dialog(client.telegram_id)
+
+    if not already_open:
+        open_text = (
+            "💬 <b>Клиент открыл диалог с поддержкой</b>\n\n"
+            f"Клиент: <b>{html.escape(client.name)}</b>\n"
+            f"TG: <code>{client.telegram_id}</code>\n"
+            f"Username: @{html.escape(client.username) if client.username else '-'}"
+        )
+        kb = _admin_support_kb(client.id)
+        for admin_id in ADMIN_IDS:
+            try:
+                await msg.bot.send_message(admin_id, open_text, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                logger.exception("failed to notify admin %s about support open", admin_id)
+
+    await msg.answer(
+        "✅ Диалог с поддержкой открыт.\nНапиши сообщение, и администратор ответит здесь.",
+        reply_markup=client_kb(show_pay_button=_has_payable_keys(client), support_mode=True),
+    )
+
+
+@router.message(F.text == SUPPORT_CLOSE_TEXT)
+async def close_support_dialog_client(msg: Message):
+    if msg.from_user.id in ADMIN_IDS:
+        return
+    client = await get_client_by_tg(msg.from_user.id)
+    if not client:
+        await msg.answer("❌ Ты не зарегистрирован.")
+        return
+
+    was_open = is_client_dialog_open(client.telegram_id)
+    close_client_dialog(client.telegram_id)
+    await msg.answer(
+        "✅ Диалог с поддержкой закрыт.",
+        reply_markup=client_kb(show_pay_button=_has_payable_keys(client), support_mode=False),
+    )
+    if was_open:
+        notice = (
+            "ℹ️ <b>Клиент закрыл диалог поддержки</b>\n\n"
+            f"Клиент: <b>{html.escape(client.name)}</b>\n"
+            f"TG: <code>{client.telegram_id}</code>"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await msg.bot.send_message(admin_id, notice, parse_mode="HTML")
+            except Exception:
+                logger.exception("failed to notify admin %s about support close", admin_id)
+
+
+@router.message(F.text)
+async def support_text_from_client(msg: Message):
+    if msg.from_user.id in ADMIN_IDS:
+        return
+    client = await get_client_by_tg(msg.from_user.id)
+    if not client:
+        return
+    if not is_client_dialog_open(client.telegram_id):
+        return
+
+    text = (msg.text or "").strip()
+    if not text or text in {"📊 Мой статус", "✅ Я оплатил", SUPPORT_CLIENT_OPEN_TEXT, SUPPORT_CLOSE_TEXT}:
+        return
+
+    await _notify_admins_support_message(msg.bot, client, text)
+    await msg.answer(
+        "📨 Сообщение отправлено в поддержку.",
+        reply_markup=client_kb(show_pay_button=_has_payable_keys(client), support_mode=True),
+    )

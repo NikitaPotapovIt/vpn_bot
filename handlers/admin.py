@@ -65,6 +65,17 @@ from ssh_manager import (
     speed_test_both,
     reboot_server,
 )
+from support_dialog import (
+    SUPPORT_ADMIN_MENU_TEXT,
+    SUPPORT_CLIENT_OPEN_TEXT,
+    SUPPORT_CLOSE_TEXT,
+    SUPPORT_BROADCAST_TARGET,
+    open_client_dialog,
+    close_client_dialog,
+    set_admin_target,
+    get_admin_target,
+    clear_admin_target,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -83,6 +94,7 @@ def admin_main_kb() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👥 Клиенты"), KeyboardButton(text="🖥 Серверы")],
             [KeyboardButton(text="➕ Добавить клиента"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text=SUPPORT_ADMIN_MENU_TEXT)],
         ],
         resize_keyboard=True,
     )
@@ -98,6 +110,27 @@ def back_kb() -> ReplyKeyboardMarkup:
 def _with_home(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=rows + [[InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home")]]
+    )
+
+
+def _admin_support_dialog_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=SUPPORT_CLOSE_TEXT), KeyboardButton(text="🏠 Главное меню")]],
+        resize_keyboard=True,
+    )
+
+
+def _client_support_kb_for_admin_send(show_pay_button: bool) -> ReplyKeyboardMarkup:
+    row = [KeyboardButton(text="📊 Мой статус")]
+    if show_pay_button:
+        row.append(KeyboardButton(text="✅ Я оплатил"))
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            row,
+            [KeyboardButton(text=SUPPORT_CLIENT_OPEN_TEXT)],
+            [KeyboardButton(text=SUPPORT_CLOSE_TEXT)],
+        ],
+        resize_keyboard=True,
     )
 
 
@@ -519,6 +552,257 @@ async def cb_menu_home(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("🏠 Возврат в главное меню.")
     await cb.message.answer("Выбери раздел:", reply_markup=admin_main_kb())
     await cb.answer()
+
+
+# ─── Поддержка ────────────────────────────────────────────────────────────────
+
+
+def _support_menu_kb() -> InlineKeyboardMarkup:
+    return _with_home([
+        [InlineKeyboardButton(text="👤 Написать клиенту", callback_data="support_pick_client")],
+        [InlineKeyboardButton(text="📢 Написать всем клиентам", callback_data="support_set_broadcast")],
+        [InlineKeyboardButton(text=SUPPORT_CLOSE_TEXT, callback_data="support_close_active")],
+    ])
+
+
+async def _support_target_text(admin_id: int) -> str:
+    target = get_admin_target(admin_id)
+    if not target:
+        return "Текущий режим: <b>не выбран</b>"
+    if target == SUPPORT_BROADCAST_TARGET:
+        return "Текущий режим: <b>рассылка всем клиентам</b>"
+    client = await get_client_by_tg(int(target))
+    if client:
+        return (
+            "Текущий режим: "
+            f"<b>диалог с {html.escape(client.name)}</b> "
+            f"(<code>{client.telegram_id}</code>)"
+        )
+    return "Текущий режим: <b>не выбран</b>"
+
+
+async def _open_support_menu(message, admin_id: int, edit: bool = False):
+    text = (
+        "<b>💬 Поддержка</b>\n\n"
+        "Выбери действие:\n"
+        "• написать конкретному клиенту\n"
+        "• включить режим рассылки всем клиентам\n"
+        "• закрыть текущий диалог\n\n"
+        f"{await _support_target_text(admin_id)}"
+    )
+    if edit:
+        await message.edit_text(text, parse_mode="HTML", reply_markup=_support_menu_kb())
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=_support_menu_kb())
+
+
+@router.message(F.text == SUPPORT_ADMIN_MENU_TEXT)
+async def support_menu(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await _open_support_menu(msg, msg.from_user.id, edit=False)
+
+
+@router.callback_query(F.data == "support_menu")
+async def support_menu_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    await _open_support_menu(cb.message, cb.from_user.id, edit=True)
+    await cb.answer()
+
+
+@router.callback_query(F.data == "support_pick_client")
+async def support_pick_client(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    clients = await get_all_clients()
+    if not clients:
+        await cb.message.edit_text(
+            "<b>💬 Поддержка</b>\n\nКлиентов пока нет.",
+            parse_mode="HTML",
+            reply_markup=_with_home([[InlineKeyboardButton(text="◀️ Назад", callback_data="support_menu")]]),
+        )
+        await cb.answer()
+        return
+
+    clients.sort(key=lambda c: c.name.lower())
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{'🟢' if c.active else '🔴'} {c.name}",
+                callback_data=f"support_set_client:{c.id}",
+            )
+        ]
+        for c in clients
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="support_menu")])
+
+    await cb.message.edit_text(
+        "<b>💬 Выбор клиента</b>\n\nКому написать:",
+        parse_mode="HTML",
+        reply_markup=_with_home(rows),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("support_set_client:"))
+async def support_set_client(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    client_id = int(cb.data.split(":")[1])
+    client = await get_client_by_id(client_id)
+    if not client:
+        await cb.answer("Клиент не найден", show_alert=True)
+        return
+
+    set_admin_target(cb.from_user.id, int(client.telegram_id))
+    open_client_dialog(int(client.telegram_id))
+
+    await cb.message.edit_text(
+        (
+            "<b>💬 Режим ответа клиенту включён</b>\n\n"
+            f"Клиент: <b>{html.escape(client.name)}</b>\n"
+            f"TG: <code>{client.telegram_id}</code>\n\n"
+            "Теперь просто отправь текст, и он уйдёт клиенту.\n"
+            f"Для завершения нажми <b>{SUPPORT_CLOSE_TEXT}</b>."
+        ),
+        parse_mode="HTML",
+        reply_markup=_with_home([[InlineKeyboardButton(text="◀️ К поддержке", callback_data="support_menu")]]),
+    )
+    await cb.message.answer(
+        f"✍️ Пиши сообщение для {client.name}.",
+        reply_markup=_admin_support_dialog_kb(),
+    )
+    await cb.answer("Режим ответа активирован")
+
+
+@router.callback_query(F.data == "support_set_broadcast")
+async def support_set_broadcast(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    set_admin_target(cb.from_user.id, SUPPORT_BROADCAST_TARGET)
+    await cb.message.edit_text(
+        (
+            "<b>📢 Режим рассылки включён</b>\n\n"
+            "Следующее сообщение будет отправлено всем клиентам.\n"
+            f"Для завершения нажми <b>{SUPPORT_CLOSE_TEXT}</b>."
+        ),
+        parse_mode="HTML",
+        reply_markup=_with_home([[InlineKeyboardButton(text="◀️ К поддержке", callback_data="support_menu")]]),
+    )
+    await cb.message.answer("✍️ Напиши текст рассылки.", reply_markup=_admin_support_dialog_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("support_reply:"))
+async def support_reply_to_client(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    client_id = int(cb.data.split(":")[1])
+    client = await get_client_by_id(client_id)
+    if not client:
+        await cb.answer("Клиент не найден", show_alert=True)
+        return
+
+    set_admin_target(cb.from_user.id, int(client.telegram_id))
+    open_client_dialog(int(client.telegram_id))
+    await cb.message.answer(
+        (
+            f"✍️ Режим ответа: <b>{html.escape(client.name)}</b>\n"
+            "Напиши сообщение клиенту."
+        ),
+        parse_mode="HTML",
+        reply_markup=_admin_support_dialog_kb(),
+    )
+    await cb.answer("Режим ответа активирован")
+
+
+@router.callback_query(F.data.startswith("support_close:"))
+async def support_close_dialog_cb(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    client_id = int(cb.data.split(":")[1])
+    client = await get_client_by_id(client_id)
+    if not client:
+        await cb.answer("Клиент не найден", show_alert=True)
+        return
+
+    close_client_dialog(int(client.telegram_id))
+    try:
+        await cb.bot.send_message(
+            client.telegram_id,
+            "ℹ️ <b>Диалог с поддержкой закрыт администратором.</b>",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("failed to notify client %s about support close", client.id)
+
+    await cb.message.answer(
+        f"✅ Диалог с {client.name} закрыт.",
+        reply_markup=admin_main_kb(),
+    )
+    await cb.answer("Диалог закрыт")
+
+
+@router.callback_query(F.data == "support_close_active")
+async def support_close_active(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+    target = get_admin_target(cb.from_user.id)
+    clear_admin_target(cb.from_user.id)
+
+    if target and target != SUPPORT_BROADCAST_TARGET:
+        close_client_dialog(int(target))
+        client = await get_client_by_tg(int(target))
+        if client:
+            try:
+                await cb.bot.send_message(
+                    client.telegram_id,
+                    "ℹ️ <b>Диалог с поддержкой закрыт администратором.</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                logger.exception("failed to notify client %s about support close", client.id)
+
+    await cb.message.edit_text(
+        "<b>💬 Поддержка</b>\n\nТекущий диалог закрыт.",
+        parse_mode="HTML",
+        reply_markup=_with_home([[InlineKeyboardButton(text="◀️ К поддержке", callback_data="support_menu")]]),
+    )
+    await cb.message.answer("Главное меню:", reply_markup=admin_main_kb())
+    await cb.answer("Диалог закрыт")
+
+
+@router.message(F.text == SUPPORT_CLOSE_TEXT)
+async def support_close_dialog_msg(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+
+    target = get_admin_target(msg.from_user.id)
+    if not target:
+        await msg.answer("Активный диалог не выбран.", reply_markup=admin_main_kb())
+        return
+
+    clear_admin_target(msg.from_user.id)
+    if target == SUPPORT_BROADCAST_TARGET:
+        await msg.answer("✅ Режим рассылки закрыт.", reply_markup=admin_main_kb())
+        return
+
+    close_client_dialog(int(target))
+    client = await get_client_by_tg(int(target))
+    if client:
+        try:
+            await msg.bot.send_message(
+                client.telegram_id,
+                "ℹ️ <b>Диалог с поддержкой закрыт администратором.</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception("failed to notify client %s about support close", client.id)
+        await msg.answer(f"✅ Диалог с {client.name} закрыт.", reply_markup=admin_main_kb())
+    else:
+        await msg.answer("✅ Диалог закрыт.", reply_markup=admin_main_kb())
 
 
 # ─── Клиенты ──────────────────────────────────────────────────────────────────
@@ -2145,3 +2429,100 @@ async def remove_peer_manual(cb: CallbackQuery):
         await cb.answer("Peer удалён")
     else:
         await cb.answer("Не удалось удалить peer")
+
+
+@router.message(F.text)
+async def support_send_from_admin(msg: Message, state: FSMContext):
+    if not is_admin(msg.from_user.id):
+        return
+
+    # Не мешаем FSM-процессам (добавление клиента, ввод месяцев и т.д.).
+    if await state.get_state():
+        return
+
+    target = get_admin_target(msg.from_user.id)
+    if not target:
+        return
+
+    text = (msg.text or "").strip()
+    if not text or text in {
+        "🏠 Главное меню",
+        "◀️ Назад",
+        SUPPORT_ADMIN_MENU_TEXT,
+        SUPPORT_CLOSE_TEXT,
+    }:
+        return
+
+    sender_name = html.escape(msg.from_user.full_name or "Администратор")
+    sender_username = f"@{html.escape(msg.from_user.username)}" if msg.from_user.username else "—"
+    safe_text = html.escape(text)[:3500]
+
+    if target == SUPPORT_BROADCAST_TARGET:
+        clients = await get_all_clients()
+        unique_clients = {}
+        for c in clients:
+            if c.telegram_id in ADMIN_IDS:
+                continue
+            unique_clients[c.telegram_id] = c
+
+        delivered = 0
+        failed = 0
+        for c in unique_clients.values():
+            payload = (
+                "📢 <b>Сообщение от поддержки</b>\n\n"
+                f"{safe_text}\n\n"
+                f"<i>Отправил: {sender_name} ({sender_username})</i>"
+            )
+            try:
+                await msg.bot.send_message(
+                    c.telegram_id,
+                    payload,
+                    parse_mode="HTML",
+                    reply_markup=_client_support_kb_for_admin_send(c.payable_key_count > 0),
+                )
+                open_client_dialog(int(c.telegram_id))
+                delivered += 1
+            except Exception:
+                failed += 1
+                logger.exception("failed to broadcast support message to client %s", c.id)
+
+        await msg.answer(
+            (
+                "✅ Рассылка завершена.\n"
+                f"Доставлено: <b>{delivered}</b>\n"
+                f"Ошибок: <b>{failed}</b>"
+            ),
+            parse_mode="HTML",
+            reply_markup=_admin_support_dialog_kb(),
+        )
+        return
+
+    client = await get_client_by_tg(int(target))
+    if not client:
+        clear_admin_target(msg.from_user.id)
+        await msg.answer("❌ Клиент не найден. Выбери диалог заново.", reply_markup=admin_main_kb())
+        return
+
+    open_client_dialog(int(client.telegram_id))
+    payload = (
+        "💬 <b>Ответ поддержки</b>\n\n"
+        f"{safe_text}\n\n"
+        f"<i>Администратор: {sender_name} ({sender_username})</i>"
+    )
+    try:
+        await msg.bot.send_message(
+            client.telegram_id,
+            payload,
+            parse_mode="HTML",
+            reply_markup=_client_support_kb_for_admin_send(client.payable_key_count > 0),
+        )
+    except Exception:
+        logger.exception("failed to send support message to client %s", client.id)
+        await msg.answer("❌ Не удалось отправить сообщение клиенту.", reply_markup=_admin_support_dialog_kb())
+        return
+
+    await msg.answer(
+        f"✅ Отправлено клиенту <b>{html.escape(client.name)}</b>.",
+        parse_mode="HTML",
+        reply_markup=_admin_support_dialog_kb(),
+    )

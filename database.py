@@ -172,6 +172,26 @@ async def init_db():
             """
         )
 
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS support_dialogs (
+                client_tg_id INTEGER PRIMARY KEY,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS support_admin_targets (
+                admin_tg_id INTEGER PRIMARY KEY,
+                target_type TEXT NOT NULL,
+                target_tg_id INTEGER,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
         # Миграции старых баз
         client_columns = await _get_columns(db, "clients")
         if "paid_until" not in client_columns:
