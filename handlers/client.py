@@ -22,6 +22,12 @@ from support_dialog import (
 router = Router()
 logger = logging.getLogger(__name__)
 
+# Важно: не перехватываем апдейты админа в клиентском роутере.
+# Иначе текстовые кнопки админ-меню могут "съедаться" этим роутером
+# (он подключается раньше admin_router).
+router.message.filter(~F.from_user.id.in_(ADMIN_IDS))
+router.callback_query.filter(~F.from_user.id.in_(ADMIN_IDS))
+
 
 def _parse_date(value: str):
     if not value:
