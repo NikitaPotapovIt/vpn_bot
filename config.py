@@ -39,6 +39,12 @@ SERVERS: List[ServerConfig] = [
         port=22, ssh_user="root",
         ssh_key_path=os.getenv("SSH_KEY_PATH", "/root/.ssh/id_rsa"),
     ),
+    ServerConfig(
+        name="RCP",
+        host=os.getenv("RCP_HOST", "REDACTED_HOST"),
+        port=22, ssh_user="root",
+        ssh_key_path=os.getenv("SSH_KEY_PATH", "/root/.ssh/id_rsa"),
+    ),
 ]
 
 PAYMENT_DAY = 1
