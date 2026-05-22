@@ -5,7 +5,7 @@ from aiogram.filters import Command
 from aiogram.types import (Message, CallbackQuery,
                             ReplyKeyboardMarkup, KeyboardButton,
                             InlineKeyboardMarkup, InlineKeyboardButton)
-from database import get_client_by_tg, update_payment_status
+from database import get_client_by_tg, update_payment_status, get_client_server_names
 from scheduler import notify_payment_claimed
 from config import ADMIN_IDS
 import logging
@@ -94,6 +94,15 @@ async def _notify_admins_support_message(bot, client, text: str):
         except Exception:
             logger.exception("failed to forward support message to admin %s", admin_id)
 
+
+async def _servers_line(client) -> str:
+    servers = await get_client_server_names(client.id, active_only=True)
+    if not servers:
+        servers = [client.server_name]
+    if len(servers) == 1:
+        return f"🖥 Сервер: {servers[0]}"
+    return f"🖥 Серверы: {', '.join(servers)}"
+
 @router.message(Command("start"))
 async def cmd_start(msg: Message):
     # Администраторы обрабатываются в admin.py
@@ -104,10 +113,11 @@ async def cmd_start(msg: Message):
     if client:
         status_text = _status_human(client)
         has_payable_keys = _has_payable_keys(client)
+        servers_line = await _servers_line(client)
 
         await msg.answer(
             f"👋 <b>Привет, {client.name}!</b>\n\n"
-            f"🖥 Сервер: {client.server_name}\n"
+            f"{servers_line}\n"
             f"📱 Устройств: {client.devices}\n"
             f"💰 Оплата: {client.monthly_fee:.0f} ₽/мес\n"
             f"Статус: {status_text}",
@@ -138,6 +148,7 @@ async def cmd_status(msg: Message):
     paid_until = _parse_date(client.paid_until)
     paid_line = f"\n📅 Оплачено до: {paid_until.strftime('%d.%m.%Y')}" if paid_until else ""
     has_payable_keys = _has_payable_keys(client)
+    servers_line = await _servers_line(client)
 
     kb = None
     needs_payment = has_payable_keys and (
@@ -151,7 +162,7 @@ async def cmd_status(msg: Message):
 
     await msg.answer(
         f"📊 <b>Статус подписки</b>\n\n"
-        f"Сервер: {client.server_name}\n"
+        f"{servers_line}\n"
         f"VPN: {active}\n"
         f"Оплата: {_status_human(client)}"
         f"{paid_line}"

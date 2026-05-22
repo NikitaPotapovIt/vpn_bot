@@ -51,6 +51,7 @@ from database import (
     get_global_key_stats,
     get_last_payment_log,
     get_payment_logs_for_day,
+    get_client_server_names,
 )
 from ssh_manager import (
     get_server_status,
@@ -367,11 +368,18 @@ async def _render_client_card(client_id: int) -> Tuple[str, InlineKeyboardMarkup
 
     paid_until = _parse_date(client.paid_until)
     paid_until_text = paid_until.strftime("%d.%m.%Y") if paid_until else "—"
+    server_names = await get_client_server_names(client.id, active_only=True)
+    if not server_names:
+        server_names = [client.server_name]
+    if len(server_names) == 1:
+        server_line = f"Сервер: {server_names[0]}"
+    else:
+        server_line = f"Серверы: {', '.join(server_names)}"
 
     text = (
         f"<b>👤 {client.name}</b>\n"
         f"TG: <code>{client.telegram_id}</code> | @{client.username or '-'}\n"
-        f"Сервер (основной): {client.server_name}\n"
+        f"{server_line}\n"
         f"{vpn_line}\n"
         f"Ключей: {client.key_count} | платных: {client.payable_key_count} | неплательщиков: {client.nonpayable_key_count}\n"
         f"Тариф: <b>{_device_price_text()}</b> за устройство\n"

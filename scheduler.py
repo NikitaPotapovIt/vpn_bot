@@ -22,6 +22,7 @@ from database import (
     get_active_clients, update_payment_status, increment_reminder_day,
     set_disconnect_date, set_client_active, log_payment, reset_monthly_payments,
     get_client_keys,
+    get_client_server_names,
 )
 from ssh_manager import disable_peer
 from config import ADMIN_IDS, DEVICE_MONTHLY_PRICE
@@ -49,8 +50,7 @@ def _is_paid_now(client, today=None) -> bool:
 
 
 async def _servers_line(client) -> str:
-    keys = await get_client_keys(client.id)
-    servers = sorted({k.server_name for k in keys if k.active})
+    servers = await get_client_server_names(client.id, active_only=True)
     if not servers:
         servers = [client.server_name]
     if len(servers) == 1:
@@ -250,13 +250,14 @@ async def notify_payment_claimed(bot, client):
             InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
         ],
     ])
+    servers_line = await _servers_line(client)
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id,
                 f"💳 <b>Заявка на оплату</b>\n\n"
                 f"Клиент: <b>{client.name}</b> (@{client.username})\n"
-                f"Сервер: {client.server_name}\n"
+                f"{servers_line}\n"
                 f"Платных ключей: {client.payable_key_count}\n"
                 f"Тариф: {DEVICE_MONTHLY_PRICE:.0f} ₽/устройство\n"
                 f"Сумма за месяц: {client.monthly_fee:.0f} ₽",

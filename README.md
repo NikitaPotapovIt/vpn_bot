@@ -121,3 +121,23 @@ f"wg show {server.wg_interface}"
 # Стало:
 f"awg show {server.wg_interface}"
 ```
+
+## Бэкап VPN-конфигов (ежедневно в 04:00 МСК)
+
+Добавлены скрипты:
+- `scripts/backup_vpn_configs.py` — делает бэкап `wg0.conf` и `clientsTable` с каждого сервера в `backup_config/<server>/<timestamp>/`, хранит только последние 30 бэкапов на сервер, затем делает `git pull --rebase`, `git commit` и `git push`.
+- `scripts/install_backup_cron.sh` — ставит cron-задачу на ежедневный запуск в `04:00` по `Europe/Moscow`.
+
+Установка cron:
+
+```bash
+cd /opt/vpn_bot
+./scripts/install_backup_cron.sh
+```
+
+Проверка вручную:
+
+```bash
+cd /opt/vpn_bot
+./scripts/backup_vpn_configs.py
+```

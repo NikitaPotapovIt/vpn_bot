@@ -713,6 +713,31 @@ async def get_client_keys(client_id: int) -> List[ClientKey]:
     return [_row_to_client_key(r) for r in rows]
 
 
+async def get_client_server_names(client_id: int, active_only: bool = True) -> List[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        active_clause = "AND k.active = 1" if active_only else ""
+        query = f"""
+            SELECT DISTINCT k.server_name
+            FROM key_access ka
+            JOIN client_keys k ON k.id = ka.key_id
+            WHERE ka.client_id = ? {active_clause}
+            ORDER BY k.server_name COLLATE NOCASE
+        """
+        async with db.execute(query, (client_id,)) as cur:
+            rows = await cur.fetchall()
+            servers = [r["server_name"] for r in rows if r["server_name"]]
+
+        if servers:
+            return servers
+
+        async with db.execute("SELECT server_name FROM clients WHERE id = ?", (client_id,)) as cur:
+            row = await cur.fetchone()
+            if row and row["server_name"]:
+                return [row["server_name"]]
+    return []
+
+
 async def get_unlinked_keys() -> List[ClientKey]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
