@@ -10,13 +10,18 @@ from pathlib import Path
 from typing import Tuple
 from zoneinfo import ZoneInfo
 
-from config import SERVERS
-from ssh_manager import local_exec, ssh_exec
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKUP_ROOT = REPO_ROOT / "backup_config"
 MAX_BACKUPS_PER_SERVER = 30
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+# Позволяет запускать скрипт напрямую: ./scripts/backup_vpn_configs.py
+# и корректно импортировать модули проекта из корня репозитория.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from config import SERVERS
+from ssh_manager import local_exec, ssh_exec
 
 
 def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
