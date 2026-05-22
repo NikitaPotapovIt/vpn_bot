@@ -244,6 +244,9 @@ async def notify_payment_claimed(bot, client):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_pay:{client.id}"),
+            InlineKeyboardButton(text="🎁 Тестовый период", callback_data=f"trial_until_month_end:{client.id}"),
+        ],
+        [
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_pay:{client.id}"),
         ],
         [

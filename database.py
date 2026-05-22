@@ -335,6 +335,14 @@ async def get_client_by_tg(telegram_id: int) -> Optional[Client]:
     return clients[0] if clients else None
 
 
+async def get_client_by_username(username: str) -> Optional[Client]:
+    normalized = (username or "").strip().lstrip("@").lower()
+    if not normalized:
+        return None
+    clients = await _fetch_clients("WHERE LOWER(c.username) = ?", (normalized,))
+    return clients[0] if clients else None
+
+
 async def get_client_by_id(client_id: int) -> Optional[Client]:
     clients = await _fetch_clients("WHERE c.id = ?", (client_id,))
     return clients[0] if clients else None

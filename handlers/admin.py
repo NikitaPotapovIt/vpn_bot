@@ -9,6 +9,7 @@ from typing import Optional, Tuple, List
 
 from aiogram import Router, F
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -27,6 +28,7 @@ from database import (
     get_all_clients,
     get_client_by_id,
     get_client_by_tg,
+    get_client_by_username,
     update_payment_status,
     set_paid_until,
     set_client_active,
@@ -440,6 +442,7 @@ async def _show_months_selector(message, client_id: int, edit: bool = True):
             InlineKeyboardButton(text="✍️ Другое", callback_data=f"confirm_pay_custom:{client_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_pay:{client_id}"),
         ],
+        [InlineKeyboardButton(text="🎁 Тестовый период (до конца месяца)", callback_data=f"trial_until_month_end:{client_id}")],
         [InlineKeyboardButton(text="◀️ К клиенту", callback_data=f"client_card:{client_id}")],
     ])
 
@@ -527,6 +530,77 @@ async def _apply_payment_confirmation(bot, client_id: int, months: int, source_m
         )
     except Exception:
         logger.exception("failed to notify client %s", client.id)
+
+
+def _trial_until_month_end(today: date) -> date:
+    if today.month == 12:
+        first_next_month = date(today.year + 1, 1, 1)
+    else:
+        first_next_month = date(today.year, today.month + 1, 1)
+    return first_next_month - timedelta(days=1)
+
+
+@router.callback_query(F.data.startswith("trial_until_month_end:"))
+async def grant_trial_until_month_end(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id):
+        return
+
+    client_id = int(cb.data.split(":")[1])
+    client = await get_client_by_id(client_id)
+    if not client:
+        await cb.answer("Клиент не найден", show_alert=True)
+        return
+
+    today = date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    trial_until_dt = _trial_until_month_end(today)
+    trial_until = trial_until_dt.strftime("%Y-%m-%d")
+
+    current_paid_until_dt = _parse_date(client.paid_until)
+    effective_until_dt = trial_until_dt
+    if current_paid_until_dt and current_paid_until_dt > trial_until_dt:
+        effective_until_dt = current_paid_until_dt
+    effective_until = effective_until_dt.strftime("%Y-%m-%d")
+
+    await set_paid_until(client_id, effective_until)
+    await update_payment_status(client_id, "paid", today_str)
+    await log_payment(
+        client_id,
+        "trial_granted",
+        0,
+        note=(
+            "trial_until_month_end=1; "
+            f"trial_until={trial_until}; "
+            f"effective_until={effective_until}; "
+            f"previous_paid_until={client.paid_until or 'none'}"
+        ),
+    )
+
+    until_text = effective_until_dt.strftime("%d.%m.%Y")
+    await cb.message.edit_text(
+        (
+            "🎁 Тестовый период выдан\n\n"
+            f"Клиент: <b>{client.name}</b>\n"
+            f"Действует до: <b>{until_text}</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=_with_home([
+            [InlineKeyboardButton(text="👤 Открыть клиента", callback_data=f"client_card:{client.id}")]
+        ]),
+    )
+    await cb.answer("Тестовый период выдан")
+
+    try:
+        await cb.bot.send_message(
+            client.telegram_id,
+            (
+                "🎁 <b>Тебе выдан тестовый период</b>\n"
+                f"Доступ активен до: <b>{until_text}</b>."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("failed to notify trial grant for client %s", client.id)
 
 
 # ─── Главное меню ─────────────────────────────────────────────────────────────
@@ -1995,7 +2069,7 @@ async def add_client_inline(cb: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     await cb.message.answer(
-        "Введи <b>Telegram ID</b> нового клиента:",
+        "Введи <b>Telegram ID</b> или <b>@username</b> нового клиента:",
         parse_mode="HTML",
         reply_markup=back_kb(),
     )
@@ -2030,7 +2104,7 @@ async def create_client_from_key(cb: CallbackQuery, state: FSMContext):
         (
             f"🔗 Создание клиента из ключа <b>{key.key_name or key.wg_pubkey[:8]}</b>\n"
             f"Сервер: <b>{key.server_name}</b>\n\n"
-            "Введи <b>Telegram ID</b> клиента:"
+            "Введи <b>Telegram ID</b> или <b>@username</b> клиента:"
         ),
         parse_mode="HTML",
         reply_markup=back_kb(),
@@ -2045,7 +2119,7 @@ async def cmd_add_client(msg: Message, state: FSMContext):
         return
 
     await msg.answer(
-        "Введи <b>Telegram ID</b> нового клиента:",
+        "Введи <b>Telegram ID</b> или <b>@username</b> нового клиента:",
         parse_mode="HTML",
         reply_markup=back_kb(),
     )
@@ -2071,7 +2145,7 @@ async def go_back(msg: Message, state: FSMContext):
         PaymentMonthsForm.months,
     ]
     prompts = {
-        str(AddClientForm.telegram_id): "Введи <b>Telegram ID</b>:",
+        str(AddClientForm.telegram_id): "Введи <b>Telegram ID</b> или <b>@username</b>:",
         str(AddClientForm.name): "Введи <b>имя</b> клиента:",
         str(AddClientForm.username): "Введи <b>@username</b> (без @, или '-'):",
         str(AddClientForm.server): "Выбери <b>сервер</b>:",
@@ -2115,11 +2189,40 @@ async def add_tg_id(msg: Message, state: FSMContext):
     if msg.text in ("◀️ Назад", "🏠 Главное меню"):
         return
 
+    raw = (msg.text or "").strip()
+    resolved_username = None
+
     try:
-        tg_id = int(msg.text.strip())
+        tg_id = int(raw)
     except ValueError:
-        await msg.answer("❌ Неверный формат. Введи число.")
-        return
+        username = raw.lstrip("@")
+        if not username:
+            await msg.answer("❌ Неверный формат. Введи Telegram ID или @username.")
+            return
+
+        try:
+            chat = await msg.bot.get_chat(f"@{username}")
+        except TelegramBadRequest:
+            await msg.answer(
+                "❌ Не удалось найти пользователя по username.\n"
+                "Попроси клиента написать боту /start и попробуй снова."
+            )
+            return
+        except Exception:
+            logger.exception("failed to resolve username %s", username)
+            await msg.answer("❌ Ошибка при проверке username. Попробуй ещё раз.")
+            return
+
+        if getattr(chat, "type", None) != "private":
+            await msg.answer("❌ Этот username не похож на личный аккаунт Telegram.")
+            return
+
+        tg_id = int(chat.id)
+        resolved_username = (chat.username or username).lstrip("@")
+        await msg.answer(
+            f"✅ Нашёл пользователя: <code>{tg_id}</code> (@{resolved_username})",
+            parse_mode="HTML",
+        )
 
     existing = await get_client_by_tg(tg_id)
     if existing:
@@ -2129,7 +2232,16 @@ async def add_tg_id(msg: Message, state: FSMContext):
         )
         return
 
-    await state.update_data(telegram_id=tg_id)
+    if resolved_username:
+        username_taken = await get_client_by_username(resolved_username)
+        if username_taken:
+            await msg.answer(
+                f"❌ Клиент с username @{resolved_username} уже есть: <b>{username_taken.name}</b> (id={username_taken.id})",
+                parse_mode="HTML",
+            )
+            return
+
+    await state.update_data(telegram_id=tg_id, username=resolved_username)
     data = await state.get_data()
     suggested_name = data.get("suggested_name")
     prompt = "Введи <b>имя</b> клиента:"
@@ -2145,6 +2257,15 @@ async def add_name(msg: Message, state: FSMContext):
         return
 
     await state.update_data(name=msg.text.strip())
+    data = await state.get_data()
+    if data.get("username"):
+        await msg.answer(
+            f"✅ Username подтянул автоматически: @{data['username']}",
+            parse_mode="HTML",
+        )
+        await _add_client_show_next_step(msg, state)
+        return
+
     await msg.answer(
         "Введи <b>@username</b> (без @, или '-' если нет):",
         parse_mode="HTML",
@@ -2153,14 +2274,7 @@ async def add_name(msg: Message, state: FSMContext):
     await state.set_state(AddClientForm.username)
 
 
-@router.message(AddClientForm.username)
-async def add_username(msg: Message, state: FSMContext):
-    if msg.text in ("◀️ Назад", "🏠 Главное меню"):
-        return
-
-    username = msg.text.strip().lstrip("@")
-    await state.update_data(username=None if username == "-" else username)
-
+async def _add_client_show_next_step(msg: Message, state: FSMContext):
     data = await state.get_data()
     bind_key_id = data.get("bind_key_id")
     if bind_key_id:
@@ -2200,6 +2314,16 @@ async def add_username(msg: Message, state: FSMContext):
     )
     await msg.answer("Выбери <b>сервер</b>:", parse_mode="HTML", reply_markup=kb)
     await state.set_state(AddClientForm.server)
+
+
+@router.message(AddClientForm.username)
+async def add_username(msg: Message, state: FSMContext):
+    if msg.text in ("◀️ Назад", "🏠 Главное меню"):
+        return
+
+    username = msg.text.strip().lstrip("@")
+    await state.update_data(username=None if username == "-" else username)
+    await _add_client_show_next_step(msg, state)
 
 
 @router.callback_query(AddClientForm.server, F.data.startswith("sel_srv:"))
