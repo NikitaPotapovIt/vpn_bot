@@ -2191,6 +2191,7 @@ async def add_tg_id(msg: Message, state: FSMContext):
 
     raw = (msg.text or "").strip()
     resolved_username = None
+    tg_id = None
 
     try:
         tg_id = int(raw)
@@ -2204,33 +2205,37 @@ async def add_tg_id(msg: Message, state: FSMContext):
             chat = await msg.bot.get_chat(f"@{username}")
         except TelegramBadRequest:
             await msg.answer(
-                "❌ Не удалось найти пользователя по username.\n"
-                "Попроси клиента написать боту /start и попробуй снова."
+                "ℹ️ Не удалось получить Telegram ID через API.\n"
+                "Продолжу по username: ID привяжется автоматически, когда клиент напишет /start."
             )
-            return
+            resolved_username = username
         except Exception:
             logger.exception("failed to resolve username %s", username)
-            await msg.answer("❌ Ошибка при проверке username. Попробуй ещё раз.")
+            await msg.answer(
+                "ℹ️ Ошибка при проверке username через API.\n"
+                "Продолжу по username: ID привяжется автоматически после /start."
+            )
+            resolved_username = username
+        else:
+            if getattr(chat, "type", None) != "private":
+                await msg.answer("❌ Этот username не похож на личный аккаунт Telegram.")
+                return
+
+            tg_id = int(chat.id)
+            resolved_username = (chat.username or username).lstrip("@")
+            await msg.answer(
+                f"✅ Нашёл пользователя: <code>{tg_id}</code> (@{resolved_username})",
+                parse_mode="HTML",
+            )
+
+    if tg_id is not None:
+        existing = await get_client_by_tg(tg_id)
+        if existing:
+            await msg.answer(
+                f"❌ Клиент с таким Telegram ID уже есть: <b>{existing.name}</b> (id={existing.id})",
+                parse_mode="HTML",
+            )
             return
-
-        if getattr(chat, "type", None) != "private":
-            await msg.answer("❌ Этот username не похож на личный аккаунт Telegram.")
-            return
-
-        tg_id = int(chat.id)
-        resolved_username = (chat.username or username).lstrip("@")
-        await msg.answer(
-            f"✅ Нашёл пользователя: <code>{tg_id}</code> (@{resolved_username})",
-            parse_mode="HTML",
-        )
-
-    existing = await get_client_by_tg(tg_id)
-    if existing:
-        await msg.answer(
-            f"❌ Клиент с таким Telegram ID уже есть: <b>{existing.name}</b> (id={existing.id})",
-            parse_mode="HTML",
-        )
-        return
 
     if resolved_username:
         username_taken = await get_client_by_username(resolved_username)
@@ -2276,6 +2281,11 @@ async def add_name(msg: Message, state: FSMContext):
 
 async def _add_client_show_next_step(msg: Message, state: FSMContext):
     data = await state.get_data()
+    tg_id_text = (
+        f"<code>{data['telegram_id']}</code>"
+        if data.get("telegram_id") is not None
+        else "<i>автопривязка после /start</i>"
+    )
     bind_key_id = data.get("bind_key_id")
     if bind_key_id:
         key = await get_key_by_id(int(bind_key_id))
@@ -2292,7 +2302,7 @@ async def _add_client_show_next_step(msg: Message, state: FSMContext):
         data = await state.get_data()
         summary = (
             f"<b>Проверь данные:</b>\n\n"
-            f"Telegram ID: <code>{data['telegram_id']}</code>\n"
+            f"Telegram ID: {tg_id_text}\n"
             f"Имя: {data['name']}\n"
             f"Username: @{data.get('username') or '-'}\n"
             f"Сервер: {key.server_name}\n"
@@ -2334,7 +2344,7 @@ async def add_server(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     summary = (
         f"<b>Проверь данные:</b>\n\n"
-        f"Telegram ID: <code>{data['telegram_id']}</code>\n"
+        f"Telegram ID: {tg_id_text}\n"
         f"Имя: {data['name']}\n"
         f"Username: @{data.get('username') or '-'}\n"
         f"Сервер: {server_name}\n\n"

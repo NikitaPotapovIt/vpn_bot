@@ -5,7 +5,13 @@ from aiogram.filters import Command
 from aiogram.types import (Message, CallbackQuery,
                             ReplyKeyboardMarkup, KeyboardButton,
                             InlineKeyboardMarkup, InlineKeyboardButton)
-from database import get_client_by_tg, update_payment_status, get_client_server_names
+from database import (
+    get_client_by_tg,
+    get_unbound_client_by_username,
+    update_client_fields,
+    update_payment_status,
+    get_client_server_names,
+)
 from scheduler import notify_payment_claimed
 from config import ADMIN_IDS
 import logging
@@ -103,13 +109,30 @@ async def _servers_line(client) -> str:
         return f"🖥 Сервер: {servers[0]}"
     return f"🖥 Серверы: {', '.join(servers)}"
 
+
+async def _resolve_client_for_user(user) -> object:
+    client = await get_client_by_tg(user.id)
+    if client:
+        return client
+
+    username = (user.username or "").strip()
+    if not username:
+        return None
+
+    unbound = await get_unbound_client_by_username(username)
+    if not unbound:
+        return None
+
+    await update_client_fields(unbound.id, telegram_id=int(user.id), username=username.lstrip("@"))
+    return await get_client_by_tg(user.id)
+
 @router.message(Command("start"))
 async def cmd_start(msg: Message):
     # Администраторы обрабатываются в admin.py
     if msg.from_user.id in ADMIN_IDS:
         return
 
-    client = await get_client_by_tg(msg.from_user.id)
+    client = await _resolve_client_for_user(msg.from_user)
     if client:
         status_text = _status_human(client)
         has_payable_keys = _has_payable_keys(client)
@@ -138,7 +161,7 @@ async def cmd_start(msg: Message):
 async def cmd_status(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
-    client = await get_client_by_tg(msg.from_user.id)
+    client = await _resolve_client_for_user(msg.from_user)
     if not client:
         await msg.answer("❌ Ты не зарегистрирован.")
         return
@@ -178,7 +201,7 @@ async def cmd_status(msg: Message):
 async def btn_paid(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
-    client = await get_client_by_tg(msg.from_user.id)
+    client = await _resolve_client_for_user(msg.from_user)
     if not client:
         await msg.answer("❌ Ты не зарегистрирован.")
         return
@@ -187,7 +210,7 @@ async def btn_paid(msg: Message):
 @router.callback_query(F.data.startswith("paid:"))
 async def client_paid(cb: CallbackQuery):
     client_id = int(cb.data.split(":")[1])
-    client = await get_client_by_tg(cb.from_user.id)
+    client = await _resolve_client_for_user(cb.from_user)
     if not client or client.id != client_id:
         await cb.answer("❌ Ошибка авторизации", show_alert=True)
         return
@@ -246,7 +269,7 @@ async def _process_paid(bot, client, reply=None, callback=None):
 async def open_support_dialog(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
-    client = await get_client_by_tg(msg.from_user.id)
+    client = await _resolve_client_for_user(msg.from_user)
     if not client:
         await msg.answer("❌ Ты не зарегистрирован.")
         return
@@ -278,7 +301,7 @@ async def open_support_dialog(msg: Message):
 async def close_support_dialog_client(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
-    client = await get_client_by_tg(msg.from_user.id)
+    client = await _resolve_client_for_user(msg.from_user)
     if not client:
         await msg.answer("❌ Ты не зарегистрирован.")
         return
@@ -306,7 +329,7 @@ async def close_support_dialog_client(msg: Message):
 async def support_text_from_client(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
-    client = await get_client_by_tg(msg.from_user.id)
+    client = await _resolve_client_for_user(msg.from_user)
     if not client:
         return
     if not is_client_dialog_open(client.telegram_id):

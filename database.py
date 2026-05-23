@@ -259,9 +259,9 @@ async def init_db():
 
 
 async def add_client(
-    telegram_id: int,
+    telegram_id: Optional[int],
     name: str,
-    username: str,
+    username: Optional[str],
     server_name: str,
     devices: int,
     monthly_fee: float,
@@ -340,6 +340,17 @@ async def get_client_by_username(username: str) -> Optional[Client]:
     if not normalized:
         return None
     clients = await _fetch_clients("WHERE LOWER(c.username) = ?", (normalized,))
+    return clients[0] if clients else None
+
+
+async def get_unbound_client_by_username(username: str) -> Optional[Client]:
+    normalized = (username or "").strip().lstrip("@").lower()
+    if not normalized:
+        return None
+    clients = await _fetch_clients(
+        "WHERE LOWER(c.username) = ? AND c.telegram_id IS NULL",
+        (normalized,),
+    )
     return clients[0] if clients else None
 
 
