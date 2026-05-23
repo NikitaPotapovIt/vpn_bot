@@ -204,6 +204,9 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local VPN backups (stored in a separate backup repository)
+backup_config/
+
 # Ruff stuff:
 .ruff_cache/
 

@@ -2,6 +2,7 @@
 """Ежедневный бэкап VPN-конфигов с git sync и ротацией."""
 
 import asyncio
+import os
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKUP_ROOT = REPO_ROOT / "backup_config"
 MAX_BACKUPS_PER_SERVER = 30
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+BACKUP_REMOTE_URL = os.getenv("BACKUP_GIT_REPO_URL", "git@github.com:your-org/your-backup-repo.git")
+BACKUP_REPO_DIR = Path(os.getenv("BACKUP_GIT_LOCAL_DIR", "/root/vpn_backup_repo"))
+BACKUP_BRANCH = os.getenv("BACKUP_GIT_BRANCH", "main")
 
 # Позволяет запускать скрипт напрямую: ./scripts/backup_vpn_configs.py
 # и корректно импортировать модули проекта из корня репозитория.
@@ -24,17 +28,17 @@ from config import SERVERS
 from ssh_manager import local_exec, ssh_exec
 
 
-def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
-        cwd=REPO_ROOT,
+        cwd=cwd,
         text=True,
         capture_output=True,
     )
 
 
-def _must_git(args: list[str]) -> str:
-    proc = _run_git(args)
+def _must_git(args: list[str], cwd: Path) -> str:
+    proc = _run_git(args, cwd=cwd)
     if proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout.strip()
@@ -82,14 +86,83 @@ async def _backup_server(server) -> Path:
     return backup_dir
 
 
+def _ensure_backup_repo() -> Path:
+    if (BACKUP_REPO_DIR / ".git").exists():
+        _must_git(["remote", "set-url", "origin", BACKUP_REMOTE_URL], cwd=BACKUP_REPO_DIR)
+    else:
+        BACKUP_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+        if BACKUP_REPO_DIR.exists():
+            shutil.rmtree(BACKUP_REPO_DIR, ignore_errors=True)
+        _must_git(["clone", BACKUP_REMOTE_URL, str(BACKUP_REPO_DIR)], cwd=REPO_ROOT)
+    return BACKUP_REPO_DIR
+
+
+def _copy_tree(src: Path, dst: Path):
+    dst.mkdir(parents=True, exist_ok=True)
+    src_children = {p.name for p in src.iterdir()}
+    for p in dst.iterdir():
+        if p.name == ".git":
+            continue
+        if p.name not in src_children:
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                p.unlink(missing_ok=True)
+    for child in src.iterdir():
+        target = dst / child.name
+        if child.is_dir():
+            _copy_tree(child, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target)
+
+
+def _resolve_backup_branch(backup_repo: Path) -> str:
+    branch = BACKUP_BRANCH
+    local_has_branch = _run_git(
+        ["show-ref", "--verify", f"refs/heads/{branch}"],
+        cwd=backup_repo,
+    ).returncode == 0
+    if local_has_branch:
+        return branch
+
+    remote_head_proc = _run_git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd=backup_repo)
+    if remote_head_proc.returncode == 0:
+        return remote_head_proc.stdout.strip().split("/", 1)[1]
+
+    remote_branches = _must_git(["branch", "-r"], cwd=backup_repo).splitlines()
+    remote_branches = [b.strip() for b in remote_branches if b.strip() and "->" not in b]
+    candidates = [b.split("/", 1)[1] for b in remote_branches if b.startswith("origin/")]
+    if "master" in candidates:
+        return "master"
+    if "main" in candidates:
+        return "main"
+    if candidates:
+        return candidates[0]
+    raise RuntimeError("No remote branches found in backup repository")
+
+
 def _git_sync_backups() -> bool:
-    branch = _must_git(["rev-parse", "--abbrev-ref", "HEAD"])
-    _must_git(["pull", "--rebase", "origin", branch])
-    _must_git(["add", "backup_config"])
+    backup_repo = _ensure_backup_repo()
+    _must_git(["fetch", "origin"], cwd=backup_repo)
+    branch = _resolve_backup_branch(backup_repo)
+    local_has_branch = _run_git(
+        ["show-ref", "--verify", f"refs/heads/{branch}"],
+        cwd=backup_repo,
+    ).returncode == 0
+    if local_has_branch:
+        _must_git(["checkout", branch], cwd=backup_repo)
+    else:
+        _must_git(["checkout", "-b", branch, f"origin/{branch}"], cwd=backup_repo)
+    _must_git(["pull", "--rebase", "origin", branch], cwd=backup_repo)
+
+    target_backup_dir = backup_repo / "backup_config"
+    _copy_tree(BACKUP_ROOT, target_backup_dir)
+    _must_git(["add", "backup_config"], cwd=backup_repo)
 
     staged = subprocess.run(
         ["git", "diff", "--cached", "--quiet"],
-        cwd=REPO_ROOT,
+        cwd=backup_repo,
         text=True,
         capture_output=True,
     )
@@ -97,8 +170,8 @@ def _git_sync_backups() -> bool:
         return False
 
     commit_time = datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
-    _must_git(["commit", "-m", f"backup(vpn): {commit_time}"])
-    _must_git(["push", "origin", branch])
+    _must_git(["commit", "-m", f"backup(vpn): {commit_time}"], cwd=backup_repo)
+    _must_git(["push", "origin", branch], cwd=backup_repo)
     return True
 
 
