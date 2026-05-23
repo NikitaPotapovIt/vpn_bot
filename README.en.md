@@ -72,7 +72,7 @@ Preferred format:
 - `SERVER_1_NAME`, `SERVER_1_HOST`, `SERVER_1_PORT`, `SERVER_1_SSH_USER`, `SERVER_1_SSH_KEY_PATH`, `SERVER_1_WG_INTERFACE`, `SERVER_1_WG_CONFIG_PATH`, `SERVER_1_IS_LOCAL`
 - then `SERVER_2_*`, `SERVER_3_*`, etc.
 
-Legacy variables (`GHISLAIN_HOST`, `POTAPOV_HOST`, `ALEV_HOST`, `RCP_HOST`) are still supported for backward compatibility.
+Legacy variables (`FRANCE_HOST`, `GERMANY_HOST`, `ICELAND_HOST`, `JAPAN_HOST`) are still supported for backward compatibility.
 
 ## systemd Setup
 

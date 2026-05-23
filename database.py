@@ -60,8 +60,8 @@ class KeyAccessClient:
 
 
 def _calc_monthly_fee(key_count: int, payable_devices: int, fallback_fee: float) -> float:
-    # Если у клиента уже есть связанные ключи, считаем строго по платным ключам.
-    # Fallback нужен только для legacy-записей без ключей.
+    # If client already has linked keys, calculate strictly by payable keys.
+    # Fallback is needed only for legacy records without keys.
     if key_count > 0:
         return float(payable_devices * DEVICE_MONTHLY_PRICE)
     return float(fallback_fee)
@@ -192,7 +192,17 @@ async def init_db():
             """
         )
 
-        # Миграции старых баз
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_settings (
+                tg_id INTEGER PRIMARY KEY,
+                lang TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        # Legacy DB migrations
         client_columns = await _get_columns(db, "clients")
         if "paid_until" not in client_columns:
             await db.execute("ALTER TABLE clients ADD COLUMN paid_until TEXT")
@@ -208,7 +218,7 @@ async def init_db():
         await db.execute("CREATE INDEX IF NOT EXISTS idx_client_keys_server ON client_keys(server_name)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_key_access_client_id ON key_access(client_id)")
 
-        # Перенос legacy-полей wg_pubkey/wg_peer_id в таблицу ключей
+        # Move legacy wg_pubkey/wg_peer_id into keys table
         async with db.execute(
             "SELECT id, server_name, name, active, wg_pubkey, wg_peer_id FROM clients WHERE wg_pubkey IS NOT NULL AND wg_pubkey != ''"
         ) as cur:
@@ -225,7 +235,7 @@ async def init_db():
                 (server_name, wg_pubkey, client_name, wg_peer_id, 1 if active else 0, client_id, client_id),
             )
 
-        # Миграция client_keys.client_id -> key_access
+        # Migrate client_keys.client_id -> key_access
         await db.execute(
             """
             INSERT OR IGNORE INTO key_access (key_id, client_id)
@@ -235,7 +245,7 @@ async def init_db():
             """
         )
 
-        # Заполнить billing_client_id где возможно
+        # Backfill billing_client_id where possible
         await db.execute(
             """
             UPDATE client_keys
@@ -255,6 +265,28 @@ async def init_db():
             """
         )
 
+        await db.commit()
+
+
+async def get_user_lang(tg_id: int) -> Optional[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT lang FROM user_settings WHERE tg_id = ?", (int(tg_id),)) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def set_user_lang(tg_id: int, lang: str):
+    now = datetime.now().isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO user_settings (tg_id, lang, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tg_id) DO UPDATE
+            SET lang = excluded.lang, updated_at = excluded.updated_at
+            """,
+            (int(tg_id), str(lang), now),
+        )
         await db.commit()
 
 
@@ -408,7 +440,7 @@ async def set_client_active(client_id: int, active: bool):
 
 
 async def reset_monthly_payments():
-    """1-го числа: pending только у реально неоплаченных клиентов"""
+    """Day 1 reset: set pending only for truly unpaid clients."""
     today = date.today().strftime("%Y-%m-%d")
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -474,7 +506,7 @@ async def get_last_payment_log(client_id: int, actions: Optional[List[str]] = No
 
 
 async def get_payment_logs_for_day(client_id: int, day: str, actions: Optional[List[str]] = None):
-    """Возвращает платежные логи клиента за конкретную дату (YYYY-MM-DD), по возрастанию id."""
+    """Return client's payment logs for a specific date (YYYY-MM-DD), ordered by id ascending."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if actions:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ежедневный бэкап VPN-конфигов с git sync и ротацией."""
+"""Daily backup of VPN configs with git sync and rotation."""
 
 import asyncio
 import os
@@ -19,8 +19,8 @@ BACKUP_REMOTE_URL = os.getenv("BACKUP_GIT_REPO_URL", "git@github.com:your-org/yo
 BACKUP_REPO_DIR = Path(os.getenv("BACKUP_GIT_LOCAL_DIR", "/root/vpn_backup_repo"))
 BACKUP_BRANCH = os.getenv("BACKUP_GIT_BRANCH", "main")
 
-# Позволяет запускать скрипт напрямую: ./scripts/backup_vpn_configs.py
-# и корректно импортировать модули проекта из корня репозитория.
+# Allows direct script run: ./scripts/backup_vpn_configs.py
+# and proper project-module imports from repository root.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

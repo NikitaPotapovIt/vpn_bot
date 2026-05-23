@@ -5,10 +5,11 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 from config import TELEGRAM_TOKEN, ADMIN_IDS
-from database import init_db
+from database import init_db, get_user_lang
 from scheduler import init_scheduler
 from handlers.admin import router as admin_router
 from handlers.client import router as client_router
+from i18n import tr, normalize_lang
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,30 +18,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 async def main():
-    # Инициализация БД
+    # Initialize DB
     await init_db()
     logger.info("Database initialized")
     
-    # Создание бота
+    # Create bot
     bot = Bot(token=TELEGRAM_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     
-    # Подключение роутеров
+    # Attach routers
     dp.include_router(client_router)
     dp.include_router(admin_router)
     
-    # Запуск планировщика
+    # Start scheduler
     scheduler = init_scheduler(bot)
     
-    # Уведомить администратора о запуске
+    # Notify admins on startup
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, "🤖 <b>VPN Bot запущен!</b>\n\nКоманды:\n"
-                "/clients — список клиентов\n"
-                "/add_client — добавить клиента\n"
-                "/servers — статус всех серверов\n"
-                "/server <имя> — детально по серверу\n"
-                "/client <id> — карточка клиента")
+            lang = normalize_lang(await get_user_lang(admin_id))
+            await bot.send_message(admin_id, tr(lang, "bot_started"))
         except Exception:
             pass
     

@@ -44,9 +44,9 @@ def _sh_single_quote(command: str) -> str:
 
 def _build_vpn_uri_from_config(config_text: str) -> str:
     """
-    Формат ссылки, совместимый с импортом AmneziaVPN:
+    URI format compatible with AmneziaVPN import:
     vpn:// + Base64Url(qCompress(config_text))
-    где qCompress = 4 байта длины (BE) + zlib(payload).
+    where qCompress = 4-byte length (BE) + zlib(payload).
     """
     raw = config_text.encode("utf-8")
     compressed = zlib.compress(raw, level=8)
@@ -255,8 +255,8 @@ async def _write_awg_file(server_name: str, path: str, content: str, mode: str =
 
 async def _validate_awg_conf_text(server_name: str, conf_text: str) -> bool:
     """
-    Проверка синтаксиса через wg-quick strip.
-    Важно использовать *.conf, иначе wg-quick вернёт ошибку по имени файла.
+    Validate syntax via wg-quick strip.
+    Important: use *.conf, otherwise wg-quick fails on filename check.
     """
     cmd = (
         "tmp_base=$(mktemp /tmp/wg0XXXXXX) && "
@@ -307,7 +307,7 @@ async def _apply_awg_conf_with_rollback(server_name: str, conf_new: str, conf_ol
         else:
             return True
 
-    # Откат в случае ошибки применения runtime
+    # Roll back if runtime apply failed
     await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_old, mode="600")
     if await _sync_wg_runtime_from_conf(server_name):
         restore_old_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_old))
@@ -333,7 +333,7 @@ async def _write_clients_table(server_name: str, table: List[Dict]) -> bool:
     payload = json.dumps(table, indent=4, ensure_ascii=False) + "\n"
     return await _write_awg_file(server_name, "/opt/amnezia/awg/clientsTable", payload, mode="644")
 
-# ─── Мониторинг ───────────────────────────────────────────────────────────────
+# ─── Monitoring ───────────────────────────────────────────────────────────────
 
 async def get_server_status(server_name: str) -> Dict:
     server = _get_server(server_name)
@@ -418,7 +418,7 @@ async def get_all_peers_merged(server_name: str) -> List[Dict]:
             "endpoint": wg.get("endpoint", "—"),
         }
 
-    # Некоторые ключи могут существовать в dump, но отсутствовать в clientsTable
+    # Some keys may exist in dump but be absent in clientsTable
     for pubkey, wg in dump.items():
         if pubkey in result_map:
             continue
@@ -438,10 +438,10 @@ async def get_all_peers_merged(server_name: str) -> List[Dict]:
             "endpoint": wg.get("endpoint", "—"),
         }
 
-    # Стабильная сортировка по имени, затем по ключу
+    # Stable sort by name, then by key
     return sorted(result_map.values(), key=lambda p: ((p.get("name") or "").lower(), p["pubkey"]))
 
-# ─── Пинг и скорость ──────────────────────────────────────────────────────────
+# ─── Ping and speed ───────────────────────────────────────────────────────────
 
 async def ping_server(server_name: str) -> Dict:
     server = _get_server(server_name)
@@ -535,12 +535,12 @@ async def _speed_test_ctx(server_name: str, context: str) -> Dict:
         result_out, _, code2 = await _exec_in_context(server_name, f"{binary} --simple 2>&1", context)
         if code2 == 0:
             data = _parse_speedtest_simple(result_out)
-            # Некоторые версии speedtest-cli в контейнере возвращают 0.00/0.00.
-            # В таком случае считаем результат невалидным и пробуем альтернативы.
+            # Some speedtest-cli versions in container return 0.00/0.00.
+            # Treat as invalid and try alternatives.
             if data and _is_nonzero_speed_result(data):
                 return {"success": True, "context": location, "method": "speedtest-cli", **data}
 
-    # Попытка 2: wget (download only) по нескольким URL
+    # Attempt 2: wget (download only) across several URLs
     for url in test_urls:
         wget_cmd = f"wget -O /dev/null --report-speed=bits --timeout=15 {url} 2>&1 | tail -5"
         out, _, _ = await _exec_in_context(server_name, wget_cmd, context)
@@ -548,7 +548,7 @@ async def _speed_test_ctx(server_name: str, context: str) -> Dict:
         if mbps is not None:
             return {"success": True, "context": location, "method": f"wget ({url})", "download_mbps": mbps}
 
-    # Попытка 3: curl (download only) по нескольким URL с валидацией size/http_code
+    # Attempt 3: curl (download only) across several URLs with size/http_code validation
     last_diag = ""
     for url in test_urls:
         curl_cmd = (
@@ -593,7 +593,7 @@ async def speed_test_vpn(server_name: str) -> Dict:
 
 
 async def speed_test(server_name: str) -> Dict:
-    """Совместимость со старым API: тест хоста."""
+    """Backward compatibility: host speed test."""
     return await speed_test_host(server_name)
 
 
@@ -608,14 +608,14 @@ async def reboot_server(server_name: str) -> Dict:
     if not server:
         return {"success": False, "error": f"Server '{server_name}' not found"}
 
-    # Возвращает управление сразу, перезагрузка происходит спустя несколько секунд.
+    # Returns immediately; reboot happens a few seconds later.
     cmd = "nohup sh -c 'sleep 2 && reboot' >/dev/null 2>&1 &"
     _, err, code = await _exec(server_name, cmd)
     if code == 0:
         return {"success": True}
     return {"success": False, "error": err or "не удалось запланировать reboot"}
 
-# ─── Управление peer'ами ──────────────────────────────────────────────────────
+# ─── Peer management ──────────────────────────────────────────────────────────
 
 async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     priv_out, _, code = await _exec(server_name, _docker("wg genkey"))
@@ -668,13 +668,13 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     )
     _, _, apply_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
     if apply_code != 0:
-        # Если runtime-применение не удалось, откатываем файл конфига.
+        # If runtime apply failed, roll back config file.
         await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
         await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_out, mode="600")
         await _sync_wg_runtime_from_conf(server_name)
         return None
 
-    # Обновляем clientsTable (при повреждении файла не перетираем его).
+    # Update clientsTable (if file is corrupted, do not overwrite it).
     import datetime
     table = await _load_clients_table_strict(server_name)
     if table is not None:

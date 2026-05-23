@@ -1,4 +1,4 @@
-"""Обработчики для клиентов VPN"""
+"""VPN client handlers."""
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -11,6 +11,8 @@ from database import (
     update_client_fields,
     update_payment_status,
     get_client_server_names,
+    get_user_lang,
+    set_user_lang,
 )
 from scheduler import notify_payment_claimed
 from config import ADMIN_IDS
@@ -18,21 +20,35 @@ import logging
 import html
 from datetime import datetime, date
 from support_dialog import (
-    SUPPORT_CLIENT_OPEN_TEXT,
-    SUPPORT_CLOSE_TEXT,
     open_client_dialog,
     close_client_dialog,
     is_client_dialog_open,
 )
+from i18n import tr, normalize_lang
 
 router = Router()
 logger = logging.getLogger(__name__)
 
-# Важно: не перехватываем апдейты админа в клиентском роутере.
-# Иначе текстовые кнопки админ-меню могут "съедаться" этим роутером
-# (он подключается раньше admin_router).
+# Important: do not intercept admin updates in the client router.
+# Otherwise admin menu text buttons can be swallowed by this router
+# (it is attached before admin_router).
 router.message.filter(~F.from_user.id.in_(ADMIN_IDS))
 router.callback_query.filter(~F.from_user.id.in_(ADMIN_IDS))
+
+CLIENT_STATUS_TEXTS = {"📊 Мой статус", "📊 My status"}
+CLIENT_PAID_TEXTS = {"✅ Я оплатил", "✅ I paid"}
+SUPPORT_OPEN_TEXTS = {"💬 Написать в поддержку", "💬 Contact support"}
+SUPPORT_CLOSE_TEXTS = {"❌ Закрыть диалог", "❌ Close dialog"}
+LANG_BUTTON_TEXTS = {"🌐 Язык", "🌐 Language"}
+
+
+async def _lang_for_user(user) -> str:
+    saved = await get_user_lang(user.id)
+    if saved:
+        return normalize_lang(saved)
+    detected = normalize_lang(getattr(user, "language_code", None))
+    await set_user_lang(user.id, detected)
+    return detected
 
 
 def _parse_date(value: str):
@@ -45,18 +61,23 @@ def _parse_date(value: str):
 
 
 def _status_human(client) -> str:
+    lang = normalize_lang(getattr(client, "lang", None))
     if not _has_payable_keys(client):
-        return "🚫 Оплата не требуется"
+        return "🚫 Payment is not required" if lang == "en" else "🚫 Оплата не требуется"
     paid_until = _parse_date(client.paid_until)
     if paid_until and paid_until >= date.today():
-        return f"✅ Оплачено до {paid_until.strftime('%d.%m.%Y')}"
+        return (
+            f"✅ Paid until {paid_until.strftime('%d.%m.%Y')}"
+            if lang == "en"
+            else f"✅ Оплачено до {paid_until.strftime('%d.%m.%Y')}"
+        )
     if client.payment_status == "paid":
-        return "⏳ Ожидает продления"
+        return "⏳ Renewal pending" if lang == "en" else "⏳ Ожидает продления"
     return {
-        "paid": "✅ Оплачено",
-        "pending": "⏳ Ожидает оплаты",
-        "waiting_confirm": "🔄 Проверяется",
-        "overdue": "🔴 Просрочено",
+        "paid": "✅ Paid" if lang == "en" else "✅ Оплачено",
+        "pending": "⏳ Awaiting payment" if lang == "en" else "⏳ Ожидает оплаты",
+        "waiting_confirm": "🔄 Under review" if lang == "en" else "🔄 Проверяется",
+        "overdue": "🔴 Overdue" if lang == "en" else "🔴 Просрочено",
     }.get(client.payment_status, client.payment_status)
 
 
@@ -64,13 +85,13 @@ def _has_payable_keys(client) -> bool:
     return int(getattr(client, "payable_key_count", 0) or 0) > 0
 
 
-def client_kb(show_pay_button: bool = True, support_mode: bool = False) -> ReplyKeyboardMarkup:
-    row = [KeyboardButton(text="📊 Мой статус")]
+def client_kb(lang: str, show_pay_button: bool = True, support_mode: bool = False) -> ReplyKeyboardMarkup:
+    row = [KeyboardButton(text=tr(lang, "client_status_btn"))]
     if show_pay_button:
-        row.append(KeyboardButton(text="✅ Я оплатил"))
-    keyboard = [row, [KeyboardButton(text=SUPPORT_CLIENT_OPEN_TEXT)]]
+        row.append(KeyboardButton(text=tr(lang, "client_paid_btn")))
+    keyboard = [row, [KeyboardButton(text=tr(lang, "support_open"))], [KeyboardButton(text=tr(lang, "lang_button"))]]
     if support_mode:
-        keyboard.append([KeyboardButton(text=SUPPORT_CLOSE_TEXT)])
+        keyboard.append([KeyboardButton(text=tr(lang, "support_close"))])
     return ReplyKeyboardMarkup(
         keyboard=keyboard,
         resize_keyboard=True,
@@ -102,12 +123,13 @@ async def _notify_admins_support_message(bot, client, text: str):
 
 
 async def _servers_line(client) -> str:
+    lang = normalize_lang(await get_user_lang(client.telegram_id))
     servers = await get_client_server_names(client.id, active_only=True)
     if not servers:
         servers = [client.server_name]
     if len(servers) == 1:
-        return f"🖥 Сервер: {servers[0]}"
-    return f"🖥 Серверы: {', '.join(servers)}"
+        return f"🖥 Server: {servers[0]}" if lang == "en" else f"🖥 Сервер: {servers[0]}"
+    return f"🖥 Servers: {', '.join(servers)}" if lang == "en" else f"🖥 Серверы: {', '.join(servers)}"
 
 
 async def _resolve_client_for_user(user) -> object:
@@ -128,10 +150,11 @@ async def _resolve_client_for_user(user) -> object:
 
 @router.message(Command("start"))
 async def cmd_start(msg: Message):
-    # Администраторы обрабатываются в admin.py
+    # Admins are handled in admin.py
     if msg.from_user.id in ADMIN_IDS:
         return
 
+    lang = await _lang_for_user(msg.from_user)
     client = await _resolve_client_for_user(msg.from_user)
     if client:
         status_text = _status_human(client)
@@ -139,37 +162,44 @@ async def cmd_start(msg: Message):
         servers_line = await _servers_line(client)
 
         await msg.answer(
-            f"👋 <b>Привет, {client.name}!</b>\n\n"
+            f"👋 <b>{'Привет' if lang == 'ru' else 'Hello'}, {client.name}!</b>\n\n"
             f"{servers_line}\n"
-            f"📱 Устройств: {client.devices}\n"
-            f"💰 Оплата: {client.monthly_fee:.0f} ₽/мес\n"
-            f"Статус: {status_text}",
+            f"{'📱 Устройств' if lang == 'ru' else '📱 Devices'}: {client.devices}\n"
+            f"{'💰 Оплата' if lang == 'ru' else '💰 Payment'}: {client.monthly_fee:.0f} ₽/{'мес' if lang == 'ru' else 'mo'}\n"
+            f"{'Статус' if lang == 'ru' else 'Status'}: {status_text}",
             parse_mode="HTML",
             reply_markup=client_kb(
+                lang=lang,
                 show_pay_button=has_payable_keys,
                 support_mode=is_client_dialog_open(msg.from_user.id),
             ),
         )
     else:
-        await msg.answer(
-            "Привет! Ты не зарегистрирован в системе.\n"
-            "Обратись к администратору для подключения."
-        )
+        await msg.answer(tr(lang, "client_not_registered_long"))
 
-@router.message(F.text == "📊 Мой статус")
+@router.message(F.text.in_(CLIENT_STATUS_TEXTS))
 @router.message(Command("status"))
 async def cmd_status(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
+    lang = await _lang_for_user(msg.from_user)
     client = await _resolve_client_for_user(msg.from_user)
     if not client:
-        await msg.answer("❌ Ты не зарегистрирован.")
+        await msg.answer(tr(lang, "client_not_registered"))
         return
 
-    active = "🟢 активен" if client.active else "🔴 отключён"
-    disc = f"\n⚠️ Плановое отключение: {client.disconnect_date}" if client.disconnect_date else ""
+    active = "🟢 active" if (lang == "en" and client.active) else ("🔴 disabled" if lang == "en" else ("🟢 активен" if client.active else "🔴 отключён"))
+    disc = (
+        f"\n⚠️ Planned disconnect: {client.disconnect_date}"
+        if (lang == "en" and client.disconnect_date)
+        else (f"\n⚠️ Плановое отключение: {client.disconnect_date}" if client.disconnect_date else "")
+    )
     paid_until = _parse_date(client.paid_until)
-    paid_line = f"\n📅 Оплачено до: {paid_until.strftime('%d.%m.%Y')}" if paid_until else ""
+    paid_line = (
+        f"\n📅 Paid until: {paid_until.strftime('%d.%m.%Y')}"
+        if (lang == "en" and paid_until)
+        else (f"\n📅 Оплачено до: {paid_until.strftime('%d.%m.%Y')}" if paid_until else "")
+    )
     has_payable_keys = _has_payable_keys(client)
     servers_line = await _servers_line(client)
 
@@ -180,56 +210,59 @@ async def cmd_status(msg: Message):
     )
     if needs_payment:
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"paid:{client.id}")
+            InlineKeyboardButton(text=tr(lang, "client_paid_btn"), callback_data=f"paid:{client.id}")
         ]])
 
     await msg.answer(
-        f"📊 <b>Статус подписки</b>\n\n"
+        f"📊 <b>{'Статус подписки' if lang == 'ru' else 'Subscription status'}</b>\n\n"
         f"{servers_line}\n"
         f"VPN: {active}\n"
-        f"Оплата: {_status_human(client)}"
+        f"{'Оплата' if lang == 'ru' else 'Payment'}: {_status_human(client)}"
         f"{paid_line}"
         f"{disc}",
         parse_mode="HTML",
         reply_markup=kb or client_kb(
+            lang=lang,
             show_pay_button=has_payable_keys,
             support_mode=is_client_dialog_open(msg.from_user.id),
         ),
     )
 
-@router.message(F.text == "✅ Я оплатил")
+@router.message(F.text.in_(CLIENT_PAID_TEXTS))
 async def btn_paid(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
+    lang = await _lang_for_user(msg.from_user)
     client = await _resolve_client_for_user(msg.from_user)
     if not client:
-        await msg.answer("❌ Ты не зарегистрирован.")
+        await msg.answer(tr(lang, "client_not_registered"))
         return
-    await _process_paid(msg.bot, client, reply=msg)
+    await _process_paid(msg.bot, client, lang=lang, reply=msg)
 
 @router.callback_query(F.data.startswith("paid:"))
 async def client_paid(cb: CallbackQuery):
+    lang = await _lang_for_user(cb.from_user)
     client_id = int(cb.data.split(":")[1])
     client = await _resolve_client_for_user(cb.from_user)
     if not client or client.id != client_id:
-        await cb.answer("❌ Ошибка авторизации", show_alert=True)
+        await cb.answer(tr(lang, "auth_error"), show_alert=True)
         return
-    await _process_paid(cb.bot, client, callback=cb)
+    await _process_paid(cb.bot, client, lang=lang, callback=cb)
 
-async def _process_paid(bot, client, reply=None, callback=None):
+async def _process_paid(bot, client, lang: str, reply=None, callback=None):
     if not _has_payable_keys(client):
-        text = "Для этого аккаунта оплата не требуется."
+        text = "Payment is not required for this account." if lang == "en" else "Для этого аккаунта оплата не требуется."
         if callback:
             await callback.answer(text, show_alert=True)
         else:
             await reply.answer(
                 text,
-                reply_markup=client_kb(show_pay_button=False, support_mode=is_client_dialog_open(client.telegram_id)),
+                reply_markup=client_kb(lang=lang, show_pay_button=False, support_mode=is_client_dialog_open(client.telegram_id)),
             )
         return
 
     if client.payment_status == "waiting_confirm":
-        text = "Оплата уже отправлена на проверку! Ожидай подтверждения. 🔄"
+        text = "Payment is already sent for review! Please wait for confirmation. 🔄" if lang == "en" else "Оплата уже отправлена на проверку! Ожидай подтверждения. 🔄"
         if callback:
             await callback.answer(text, show_alert=True)
         else:
@@ -237,7 +270,7 @@ async def _process_paid(bot, client, reply=None, callback=None):
         return
 
     if client.payment_status == "paid":
-        text = "Твоя оплата уже подтверждена ✅"
+        text = "Your payment is already confirmed ✅" if lang == "en" else "Твоя оплата уже подтверждена ✅"
         if callback:
             await callback.answer(text, show_alert=True)
         else:
@@ -248,30 +281,34 @@ async def _process_paid(bot, client, reply=None, callback=None):
     await notify_payment_claimed(bot, client)
 
     text = (
-        f"🔄 <b>Заявка отправлена!</b>\n\n"
-        f"Администратор проверит и подтвердит оплату."
+        "🔄 <b>Request sent!</b>\n\n"
+        "An administrator will review and confirm your payment."
+        if lang == "en"
+        else "🔄 <b>Заявка отправлена!</b>\n\nАдминистратор проверит и подтвердит оплату."
     )
     if callback:
         await callback.message.edit_text(text, parse_mode="HTML")
-        await callback.answer("Заявка отправлена!")
+        await callback.answer(tr(lang, "paid_sent"))
     else:
         await reply.answer(
             text,
             parse_mode="HTML",
             reply_markup=client_kb(
+                lang=lang,
                 show_pay_button=_has_payable_keys(client),
                 support_mode=is_client_dialog_open(client.telegram_id),
             ),
         )
 
 
-@router.message(F.text == SUPPORT_CLIENT_OPEN_TEXT)
+@router.message(F.text.in_(SUPPORT_OPEN_TEXTS))
 async def open_support_dialog(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
+    lang = await _lang_for_user(msg.from_user)
     client = await _resolve_client_for_user(msg.from_user)
     if not client:
-        await msg.answer("❌ Ты не зарегистрирован.")
+        await msg.answer(tr(lang, "client_not_registered"))
         return
 
     already_open = is_client_dialog_open(client.telegram_id)
@@ -279,8 +316,8 @@ async def open_support_dialog(msg: Message):
 
     if not already_open:
         open_text = (
-            "💬 <b>Клиент открыл диалог с поддержкой</b>\n\n"
-            f"Клиент: <b>{html.escape(client.name)}</b>\n"
+            "💬 <b>Client opened support dialog</b>\n\n"
+            f"Client: <b>{html.escape(client.name)}</b>\n"
             f"TG: <code>{client.telegram_id}</code>\n"
             f"Username: @{html.escape(client.username) if client.username else '-'}"
         )
@@ -292,30 +329,33 @@ async def open_support_dialog(msg: Message):
                 logger.exception("failed to notify admin %s about support open", admin_id)
 
     await msg.answer(
-        "✅ Диалог с поддержкой открыт.\nНапиши сообщение, и администратор ответит здесь.",
-        reply_markup=client_kb(show_pay_button=_has_payable_keys(client), support_mode=True),
+        "✅ Support dialog is open.\nWrite your message and an administrator will reply here."
+        if lang == "en"
+        else "✅ Диалог с поддержкой открыт.\nНапиши сообщение, и администратор ответит здесь.",
+        reply_markup=client_kb(lang=lang, show_pay_button=_has_payable_keys(client), support_mode=True),
     )
 
 
-@router.message(F.text == SUPPORT_CLOSE_TEXT)
+@router.message(F.text.in_(SUPPORT_CLOSE_TEXTS))
 async def close_support_dialog_client(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
+    lang = await _lang_for_user(msg.from_user)
     client = await _resolve_client_for_user(msg.from_user)
     if not client:
-        await msg.answer("❌ Ты не зарегистрирован.")
+        await msg.answer(tr(lang, "client_not_registered"))
         return
 
     was_open = is_client_dialog_open(client.telegram_id)
     close_client_dialog(client.telegram_id)
     await msg.answer(
-        "✅ Диалог с поддержкой закрыт.",
-        reply_markup=client_kb(show_pay_button=_has_payable_keys(client), support_mode=False),
+        "✅ Support dialog is closed." if lang == "en" else "✅ Диалог с поддержкой закрыт.",
+        reply_markup=client_kb(lang=lang, show_pay_button=_has_payable_keys(client), support_mode=False),
     )
     if was_open:
         notice = (
-            "ℹ️ <b>Клиент закрыл диалог поддержки</b>\n\n"
-            f"Клиент: <b>{html.escape(client.name)}</b>\n"
+            "ℹ️ <b>Client closed support dialog</b>\n\n"
+            f"Client: <b>{html.escape(client.name)}</b>\n"
             f"TG: <code>{client.telegram_id}</code>"
         )
         for admin_id in ADMIN_IDS:
@@ -329,6 +369,7 @@ async def close_support_dialog_client(msg: Message):
 async def support_text_from_client(msg: Message):
     if msg.from_user.id in ADMIN_IDS:
         return
+    lang = await _lang_for_user(msg.from_user)
     client = await _resolve_client_for_user(msg.from_user)
     if not client:
         return
@@ -336,11 +377,40 @@ async def support_text_from_client(msg: Message):
         return
 
     text = (msg.text or "").strip()
-    if not text or text in {"📊 Мой статус", "✅ Я оплатил", SUPPORT_CLIENT_OPEN_TEXT, SUPPORT_CLOSE_TEXT}:
+    if not text or text in CLIENT_STATUS_TEXTS | CLIENT_PAID_TEXTS | SUPPORT_OPEN_TEXTS | SUPPORT_CLOSE_TEXTS | LANG_BUTTON_TEXTS:
         return
 
     await _notify_admins_support_message(msg.bot, client, text)
     await msg.answer(
-        "📨 Сообщение отправлено в поддержку.",
-        reply_markup=client_kb(show_pay_button=_has_payable_keys(client), support_mode=True),
+        "📨 Message sent to support." if lang == "en" else "📨 Сообщение отправлено в поддержку.",
+        reply_markup=client_kb(lang=lang, show_pay_button=_has_payable_keys(client), support_mode=True),
     )
+
+
+@router.message(F.text.in_(LANG_BUTTON_TEXTS))
+@router.message(Command("language"))
+async def language_menu(msg: Message):
+    lang = await _lang_for_user(msg.from_user)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Русский", callback_data="lang_set:ru"),
+                InlineKeyboardButton(text="English", callback_data="lang_set:en"),
+            ]
+        ]
+    )
+    await msg.answer(tr(lang, "choose_language"), reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("lang_set:"))
+async def language_set(cb: CallbackQuery):
+    lang = normalize_lang(cb.data.split(":", 1)[1])
+    await set_user_lang(cb.from_user.id, lang)
+    client = await _resolve_client_for_user(cb.from_user)
+    has_pay = _has_payable_keys(client) if client else True
+    support_mode = is_client_dialog_open(cb.from_user.id)
+    await cb.message.answer(
+        tr(lang, "lang_saved_ru" if lang == "ru" else "lang_saved_en"),
+        reply_markup=client_kb(lang=lang, show_pay_button=has_pay, support_mode=support_mode),
+    )
+    await cb.answer()

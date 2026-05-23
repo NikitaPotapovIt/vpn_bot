@@ -72,7 +72,7 @@ python bot.py
 - `SERVER_1_NAME`, `SERVER_1_HOST`, `SERVER_1_PORT`, `SERVER_1_SSH_USER`, `SERVER_1_SSH_KEY_PATH`, `SERVER_1_WG_INTERFACE`, `SERVER_1_WG_CONFIG_PATH`, `SERVER_1_IS_LOCAL`
 - `SERVER_2_*`, `SERVER_3_*` и т.д.
 
-Поддерживается и legacy-формат (`GHISLAIN_HOST`, `POTAPOV_HOST`, `ALEV_HOST`, `RCP_HOST`) для обратной совместимости.
+Поддерживается и legacy-формат (`FRANCE_HOST`, `GERMANY_HOST`, `ICELAND_HOST`, `JAPAN_HOST`) для обратной совместимости.
 
 ## Запуск через systemd
 
