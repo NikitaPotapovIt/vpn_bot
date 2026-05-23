@@ -2342,6 +2342,11 @@ async def add_server(cb: CallbackQuery, state: FSMContext):
     await state.update_data(server=server_name)
 
     data = await state.get_data()
+    tg_id_text = (
+        f"<code>{data['telegram_id']}</code>"
+        if data.get("telegram_id") is not None
+        else "<i>автопривязка после /start</i>"
+    )
     summary = (
         f"<b>Проверь данные:</b>\n\n"
         f"Telegram ID: {tg_id_text}\n"
