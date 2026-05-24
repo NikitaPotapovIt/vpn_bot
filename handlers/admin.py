@@ -1125,6 +1125,7 @@ async def show_unlinked_info(cb: CallbackQuery):
 async def back_to_clients(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
+    lang = await _lang_for_user(cb.from_user)
     text, kb = await _build_clients_view_text(lang)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
@@ -1133,6 +1134,7 @@ async def back_to_clients(cb: CallbackQuery):
 async def client_card(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
+    lang = await _lang_for_user(cb.from_user)
     client_id = int(cb.data.split(":")[1])
     text, kb = await _render_client_card(client_id, lang)
     await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
