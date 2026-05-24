@@ -27,7 +27,7 @@ from database import (
 )
 from ssh_manager import disable_peer
 from config import ADMIN_IDS, DEVICE_MONTHLY_PRICE
-from i18n import normalize_lang
+from i18n import normalize_lang, tr
 
 logger = logging.getLogger(__name__)
 
@@ -121,10 +121,11 @@ async def monthly_reset_and_notify():
     # Notify admins
     for admin_id in ADMIN_IDS:
         try:
+            admin_lang = normalize_lang(await get_user_lang(admin_id))
             await _bot.send_message(
                 admin_id,
-                f"📅 <b>Начало расчётного периода</b>\n"
-                f"Разослано напоминаний: {len(due_clients)} клиентам",
+                f"{tr(admin_lang, 'billing_cycle_started_title')}\n"
+                f"{tr(admin_lang, 'billing_cycle_sent_count', count=len(due_clients))}",
                 parse_mode="HTML"
             )
         except Exception:
@@ -261,10 +262,15 @@ async def disconnect_check():
                 
                 for admin_id in ADMIN_IDS:
                     try:
+                        admin_lang = normalize_lang(await get_user_lang(admin_id))
                         await _bot.send_message(
                             admin_id,
-                            f"🔴 Клиент <b>{client.name}</b> (@{client.username}) "
-                            f"автоматически отключён (неоплата).",
+                            tr(
+                                admin_lang,
+                                "auto_disabled_admin",
+                                name=client.name,
+                                username=f"@{client.username}" if client.username else "—",
+                            ),
                             parse_mode="HTML"
                         )
                     except Exception:
@@ -274,35 +280,36 @@ def _paid_button(client_id: int):
     """Inline 'I paid' button."""
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Я оплатил / I paid", callback_data=f"paid:{client_id}")
+        InlineKeyboardButton(text=tr("ru", "support_paid_btn_mixed"), callback_data=f"paid:{client_id}")
     ]])
 
 async def notify_payment_claimed(bot, client):
     """Notify admins that client claimed payment."""
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_pay:{client.id}"),
-            InlineKeyboardButton(text="🎁 Тестовый период", callback_data=f"trial_until_month_end:{client.id}"),
-        ],
-        [
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_pay:{client.id}"),
-        ],
-        [
-            InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu_home"),
-        ],
-    ])
     servers_line = await _servers_line(client)
     for admin_id in ADMIN_IDS:
         try:
+            admin_lang = normalize_lang(await get_user_lang(admin_id))
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text=tr(admin_lang, "admin_confirm_btn"), callback_data=f"confirm_pay:{client.id}"),
+                    InlineKeyboardButton(text=tr(admin_lang, "admin_trial_btn"), callback_data=f"trial_until_month_end:{client.id}"),
+                ],
+                [
+                    InlineKeyboardButton(text=tr(admin_lang, "admin_reject_btn"), callback_data=f"reject_pay:{client.id}"),
+                ],
+                [
+                    InlineKeyboardButton(text=tr(admin_lang, "home_menu"), callback_data="menu_home"),
+                ],
+            ])
             await bot.send_message(
                 admin_id,
-                f"💳 <b>Заявка на оплату</b>\n\n"
-                f"Клиент: <b>{client.name}</b> (@{client.username})\n"
+                f"{tr(admin_lang, 'payment_claim_title')}\n\n"
+                f"{tr(admin_lang, 'payment_claim_client', name=client.name, username=f'@{client.username}' if client.username else '—')}\n"
                 f"{servers_line}\n"
-                f"Платных ключей: {client.payable_key_count}\n"
-                f"Тариф: {DEVICE_MONTHLY_PRICE:.0f} ₽/устройство\n"
-                f"Сумма за месяц: {client.monthly_fee:.0f} ₽",
+                f"{tr(admin_lang, 'payment_claim_billable_keys', count=client.payable_key_count)}\n"
+                f"{tr(admin_lang, 'payment_claim_tariff', price=DEVICE_MONTHLY_PRICE)}\n"
+                f"{tr(admin_lang, 'payment_claim_monthly_total', amount=client.monthly_fee)}",
                 parse_mode="HTML",
                 reply_markup=kb
             )
