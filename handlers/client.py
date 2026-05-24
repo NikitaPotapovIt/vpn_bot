@@ -98,25 +98,26 @@ def client_kb(lang: str, show_pay_button: bool = True, support_mode: bool = Fals
     )
 
 
-def _admin_support_kb(client_id: int) -> InlineKeyboardMarkup:
+def _admin_support_kb(client_id: int, lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✍️ Ответить", callback_data=f"support_reply:{client_id}"),
-        InlineKeyboardButton(text="❌ Закрыть диалог", callback_data=f"support_close:{client_id}"),
+        InlineKeyboardButton(text=tr(lang, "support_reply_btn"), callback_data=f"support_reply:{client_id}"),
+        InlineKeyboardButton(text=tr(lang, "support_close_btn"), callback_data=f"support_close:{client_id}"),
     ]])
 
 
 async def _notify_admins_support_message(bot, client, text: str):
     username = f"@{html.escape(client.username)}" if client.username else "—"
     safe_text = html.escape(text.strip())[:3500]
-    payload = (
-        "💬 <b>Сообщение в поддержку</b>\n\n"
-        f"От: <b>{html.escape(client.name)}</b>\n"
-        f"TG: <code>{client.telegram_id}</code> | {username}\n\n"
-        f"{safe_text}"
-    )
-    kb = _admin_support_kb(client.id)
     for admin_id in ADMIN_IDS:
         try:
+            admin_lang = normalize_lang(await get_user_lang(admin_id))
+            payload = (
+                f"{tr(admin_lang, 'support_message_title')}\n\n"
+                f"{tr(admin_lang, 'support_from')}: <b>{html.escape(client.name)}</b>\n"
+                f"TG: <code>{client.telegram_id}</code> | {username}\n\n"
+                f"{safe_text}"
+            )
+            kb = _admin_support_kb(client.id, admin_lang)
             await bot.send_message(admin_id, payload, parse_mode="HTML", reply_markup=kb)
         except Exception:
             logger.exception("failed to forward support message to admin %s", admin_id)
@@ -321,9 +322,10 @@ async def open_support_dialog(msg: Message):
             f"TG: <code>{client.telegram_id}</code>\n"
             f"Username: @{html.escape(client.username) if client.username else '-'}"
         )
-        kb = _admin_support_kb(client.id)
         for admin_id in ADMIN_IDS:
             try:
+                admin_lang = normalize_lang(await get_user_lang(admin_id))
+                kb = _admin_support_kb(client.id, admin_lang)
                 await msg.bot.send_message(admin_id, open_text, parse_mode="HTML", reply_markup=kb)
             except Exception:
                 logger.exception("failed to notify admin %s about support open", admin_id)
