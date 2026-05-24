@@ -13,6 +13,7 @@ Flow:
 """
 
 import asyncio
+import html
 import logging
 from datetime import datetime, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -268,8 +269,8 @@ async def disconnect_check():
                             tr(
                                 admin_lang,
                                 "auto_disabled_admin",
-                                name=client.name,
-                                username=f"@{client.username}" if client.username else "—",
+                                name=html.escape(client.name or ""),
+                                username=f"@{html.escape(client.username)}" if client.username else "—",
                             ),
                             parse_mode="HTML"
                         )
@@ -305,7 +306,7 @@ async def notify_payment_claimed(bot, client):
             await bot.send_message(
                 admin_id,
                 f"{tr(admin_lang, 'payment_claim_title')}\n\n"
-                f"{tr(admin_lang, 'payment_claim_client', name=client.name, username=f'@{client.username}' if client.username else '—')}\n"
+                f"{tr(admin_lang, 'payment_claim_client', name=html.escape(client.name or ''), username=f'@{html.escape(client.username)}' if client.username else '—')}\n"
                 f"{servers_line}\n"
                 f"{tr(admin_lang, 'payment_claim_billable_keys', count=client.payable_key_count)}\n"
                 f"{tr(admin_lang, 'payment_claim_tariff', price=DEVICE_MONTHLY_PRICE)}\n"

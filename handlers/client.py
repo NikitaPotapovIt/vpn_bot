@@ -322,9 +322,10 @@ async def open_support_dialog(msg: Message):
             f"TG: <code>{client.telegram_id}</code>\n"
             f"Username: @{html.escape(client.username) if client.username else '-'}"
         )
-        kb = _admin_support_kb(client.id)
         for admin_id in ADMIN_IDS:
             try:
+                admin_lang = normalize_lang(await get_user_lang(admin_id))
+                kb = _admin_support_kb(client.id, admin_lang)
                 await msg.bot.send_message(admin_id, open_text, parse_mode="HTML", reply_markup=kb)
             except Exception:
                 logger.exception("failed to notify admin %s about support open", admin_id)
