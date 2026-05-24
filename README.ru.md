@@ -121,8 +121,8 @@ sudo systemctl status vpn-bot
 
 По умолчанию бэкап пушится в репозиторий из `BACKUP_GIT_REPO_URL`.
 
-## Безопасность для open source
+## Если хотите меня поддержать:
 
-- Не коммитьте `.env`, приватные SSH-ключи и дампы
-- Проверьте, что все реальные IP/домены/токены находятся только в `.env`
-- Рекомендуется ограничить права SSH-ключа и доступ по IP
+- BTC bc1qqzenfgfct0uyqszpwlws4gse6690u28xrm6r9w
+- ETH 0xb79D3dfeDaA4A66b395a9a226764a980C18d7f71
+- USDT 0xb79D3dfeDaA4A66b395a9a226764a980C18d7f71

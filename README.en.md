@@ -121,8 +121,8 @@ Run manually:
 
 By default, backup sync targets `BACKUP_GIT_REPO_URL`.
 
-## Open-Source Safety Notes
+## If you want to support me:
 
-- Do not commit `.env`, private SSH keys, or dumps
-- Keep real IPs/domains/tokens only in `.env`
-- Restrict SSH key permissions and host access
+- BTC bc1qqzenfgfct0uyqszpwlws4gse6690u28xrm6r9w
+- ETH 0xb79D3dfeDaA4A66b395a9a226764a980C18d7f71
+- USDT 0xb79D3dfeDaA4A66b395a9a226764a980C18d7f71
