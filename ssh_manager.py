@@ -136,6 +136,19 @@ def _extract_awg_interface_extras(conf_text: str) -> str:
     return "\n".join(extras)
 
 
+def _is_awg2_like_config(conf_text: str, wg_show_out: str = "") -> bool:
+    text = f"{conf_text}\n{wg_show_out}".lower()
+    return any(k in text for k in ("s3", "s4", "i1", "i2", "i3", "i4", "i5"))
+
+
+def _is_awg2_server(server: Optional[ServerConfig]) -> bool:
+    if not server:
+        return False
+    label = (server.protocol_label or "").upper()
+    container = (server.vpn_container or "").lower()
+    return "AWG2" in label or container.endswith("awg2")
+
+
 def _build_awg_restore_cmd(params: Dict[str, int], wg_interface: str = "wg0") -> str:
     if not params.get("jc"):
         return ""
@@ -317,13 +330,14 @@ async def _sync_wg_runtime_from_conf(server_name: str, conf_path: Optional[str] 
     if not server:
         return False
     conf_path = conf_path or server.wg_config_path
+    wg_interface = server.wg_interface
     cmd = (
         "tmp_base=$(mktemp /tmp/wg1XXXXXX) && "
         "tmp_conf=\"${tmp_base}.conf\" && "
         "mv \"$tmp_base\" \"$tmp_conf\" && "
         f"cp {conf_path} \"$tmp_conf\" && "
         "wg-quick strip \"$tmp_conf\" > \"$tmp_conf.stripped\" && "
-        "wg syncconf wg0 \"$tmp_conf.stripped\"; "
+        f"wg syncconf {wg_interface} \"$tmp_conf.stripped\"; "
         "rc=$?; rm -f \"$tmp_conf\" \"$tmp_conf.stripped\"; exit $rc"
     )
     _, _, code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(cmd)}"))
@@ -350,7 +364,9 @@ async def _apply_awg_conf_with_rollback(server_name: str, conf_new: str, conf_ol
     if not await _write_awg_file(server_name, conf_path, conf_new, mode="600"):
         return False
 
-    restore_new_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_new), server.wg_interface)
+    restore_new_cmd = ""
+    if not _is_awg2_like_config(conf_new):
+        restore_new_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_new), server.wg_interface)
     if await _sync_wg_runtime_from_conf(server_name):
         if restore_new_cmd:
             _, _, restore_code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(restore_new_cmd)}"))
@@ -362,7 +378,9 @@ async def _apply_awg_conf_with_rollback(server_name: str, conf_new: str, conf_ol
     # Roll back if runtime apply failed
     await _write_awg_file(server_name, conf_path, conf_old, mode="600")
     if await _sync_wg_runtime_from_conf(server_name):
-        restore_old_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_old), server.wg_interface)
+        restore_old_cmd = ""
+        if not _is_awg2_like_config(conf_old):
+            restore_old_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_old), server.wg_interface)
         if restore_old_cmd:
             await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(restore_old_cmd)}"))
     return False
@@ -722,7 +740,11 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     if not await _write_awg_file(server_name, conf_path, conf_new, mode="600"):
         return None
 
-    awg_restore_cmd = _build_awg_restore_cmd(awg_params, wg_iface)
+    # Important: AWG2 has extra obfuscation params (S3/S4, I1-I5 and ranged H1-H4).
+    # Re-applying AWG1-only params here can break an AWG2 interface.
+    awg_restore_cmd = ""
+    if not _is_awg2_like_config(conf_out, wg_show_out):
+        awg_restore_cmd = _build_awg_restore_cmd(awg_params, wg_iface)
 
     runtime_apply_cmd = (
         f"tmp_psk=$(mktemp) && "
@@ -780,8 +802,15 @@ async def remove_peer(server_name: str, pubkey: str) -> bool:
     conf_new, removed = _remove_peer_from_conf_text(conf_out, pubkey)
     if removed:
         await _backup_awg_conf(server_name)
-        if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
-            return False
+        if _is_awg2_server(server):
+            _, _, code = await _exec(server_name, _docker(server_name, f"wg set {server.wg_interface} peer {pubkey} remove"))
+            if code != 0:
+                return False
+            if not await _write_awg_file(server_name, server.wg_config_path, conf_new, mode="600"):
+                return False
+        else:
+            if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+                return False
 
     table = await _load_clients_table_strict(server_name)
     if table is not None:
@@ -800,8 +829,15 @@ async def disable_peer(server_name: str, pubkey: str) -> bool:
     conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, "192.0.2.0/32")
     if changed:
         await _backup_awg_conf(server_name)
-        if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
-            return False
+        if _is_awg2_server(server):
+            _, _, code = await _exec(server_name, _docker(server_name, f"wg set {server.wg_interface} peer {pubkey} allowed-ips 192.0.2.0/32"))
+            if code != 0:
+                return False
+            if not await _write_awg_file(server_name, server.wg_config_path, conf_new, mode="600"):
+                return False
+        else:
+            if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+                return False
     return True
 
 async def enable_peer(server_name: str, pubkey: str, client_ip: str) -> bool:
@@ -818,6 +854,13 @@ async def enable_peer(server_name: str, pubkey: str, client_ip: str) -> bool:
     conf_new, changed = _replace_peer_allowed_ips_in_conf_text(conf_out, pubkey, client_ip)
     if changed:
         await _backup_awg_conf(server_name)
-        if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
-            return False
+        if _is_awg2_server(server):
+            _, _, code = await _exec(server_name, _docker(server_name, f"wg set {server.wg_interface} peer {pubkey} allowed-ips {client_ip}"))
+            if code != 0:
+                return False
+            if not await _write_awg_file(server_name, server.wg_config_path, conf_new, mode="600"):
+                return False
+        else:
+            if not await _apply_awg_conf_with_rollback(server_name, conf_new, conf_out):
+                return False
     return True
