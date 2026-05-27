@@ -34,8 +34,11 @@ async def ssh_exec(server_name: str, command: str) -> Tuple[str, str, int]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _ssh_exec, server, command)
 
-def _docker(cmd: str) -> str:
-    return f"docker exec amnezia-awg {cmd}"
+def _docker(server_name: str, cmd: str, stdin: bool = False) -> str:
+    server = _get_server(server_name)
+    container = server.vpn_container if server else "amnezia-awg"
+    stdin_flag = "-i " if stdin else ""
+    return f"docker exec {stdin_flag}{container} {cmd}"
 
 
 def _sh_single_quote(command: str) -> str:
@@ -96,11 +99,48 @@ def _awg_params_text(params: Dict[str, int]) -> str:
     )
 
 
-def _build_awg_restore_cmd(params: Dict[str, int]) -> str:
+def _extract_awg_interface_extras(conf_text: str) -> str:
+    """
+    Keep AWG obfuscation parameters from [Interface] for generated client configs.
+    AWG2 relies on values like S3/S4 and I1-I5; copying extras keeps parity with server settings.
+    """
+    extras: List[str] = []
+    in_interface = False
+    skip_keys = {
+        "privatekey",
+        "address",
+        "dns",
+        "mtu",
+        "listenport",
+        "fwmark",
+        "table",
+        "saveconfig",
+        "postup",
+        "postdown",
+        "preup",
+        "predown",
+    }
+    for raw_line in conf_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_interface = line.lower() == "[interface]"
+            continue
+        if not in_interface or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip().lower()
+        if key in skip_keys:
+            continue
+        extras.append(raw_line.strip())
+    return "\n".join(extras)
+
+
+def _build_awg_restore_cmd(params: Dict[str, int], wg_interface: str = "wg0") -> str:
     if not params.get("jc"):
         return ""
     return (
-        "wg set wg0 "
+        f"wg set {wg_interface} "
         f"jc {params.get('jc', 0)} "
         f"jmin {params.get('jmin', 50)} "
         f"jmax {params.get('jmax', 1000)} "
@@ -236,7 +276,7 @@ async def _exec(server_name: str, command: str) -> Tuple[str, str, int]:
 
 
 async def _read_awg_file(server_name: str, path: str) -> Optional[str]:
-    out, _, code = await _exec(server_name, _docker(f"cat {path}"))
+    out, _, code = await _exec(server_name, _docker(server_name, f"cat {path}"))
     if code != 0:
         return None
     return out
@@ -249,7 +289,7 @@ async def _write_awg_file(server_name: str, path: str, content: str, mode: str =
         "CFGEOF\n"
         f"chmod {mode} {path}"
     )
-    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(write_cmd)}"))
+    _, _, code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(write_cmd)}"))
     return code == 0
 
 
@@ -268,11 +308,15 @@ async def _validate_awg_conf_text(server_name: str, conf_text: str) -> bool:
         "wg-quick strip \"$tmp_conf\" >/dev/null 2>&1; "
         "rc=$?; rm -f \"$tmp_conf\"; exit $rc"
     )
-    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(cmd)}"))
+    _, _, code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(cmd)}"))
     return code == 0
 
 
-async def _sync_wg_runtime_from_conf(server_name: str, conf_path: str = "/opt/amnezia/awg/wg0.conf") -> bool:
+async def _sync_wg_runtime_from_conf(server_name: str, conf_path: Optional[str] = None) -> bool:
+    server = _get_server(server_name)
+    if not server:
+        return False
+    conf_path = conf_path or server.wg_config_path
     cmd = (
         "tmp_base=$(mktemp /tmp/wg1XXXXXX) && "
         "tmp_conf=\"${tmp_base}.conf\" && "
@@ -282,42 +326,53 @@ async def _sync_wg_runtime_from_conf(server_name: str, conf_path: str = "/opt/am
         "wg syncconf wg0 \"$tmp_conf.stripped\"; "
         "rc=$?; rm -f \"$tmp_conf\" \"$tmp_conf.stripped\"; exit $rc"
     )
-    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(cmd)}"))
+    _, _, code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(cmd)}"))
     return code == 0
 
 
 async def _backup_awg_conf(server_name: str) -> bool:
-    cmd = "cp /opt/amnezia/awg/wg0.conf /opt/amnezia/awg/wg0.conf.autobak_$(date +%Y%m%d_%H%M%S)"
-    _, _, code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(cmd)}"))
+    server = _get_server(server_name)
+    if not server:
+        return False
+    conf_path = server.wg_config_path
+    cmd = f"cp {conf_path} {conf_path}.autobak_$(date +%Y%m%d_%H%M%S)"
+    _, _, code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(cmd)}"))
     return code == 0
 
 
 async def _apply_awg_conf_with_rollback(server_name: str, conf_new: str, conf_old: str) -> bool:
+    server = _get_server(server_name)
+    if not server:
+        return False
+    conf_path = server.wg_config_path
     if not await _validate_awg_conf_text(server_name, conf_new):
         return False
-    if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
+    if not await _write_awg_file(server_name, conf_path, conf_new, mode="600"):
         return False
 
-    restore_new_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_new))
+    restore_new_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_new), server.wg_interface)
     if await _sync_wg_runtime_from_conf(server_name):
         if restore_new_cmd:
-            _, _, restore_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(restore_new_cmd)}"))
+            _, _, restore_code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(restore_new_cmd)}"))
             if restore_code == 0:
                 return True
         else:
             return True
 
     # Roll back if runtime apply failed
-    await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_old, mode="600")
+    await _write_awg_file(server_name, conf_path, conf_old, mode="600")
     if await _sync_wg_runtime_from_conf(server_name):
-        restore_old_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_old))
+        restore_old_cmd = _build_awg_restore_cmd(_extract_awg_params("", conf_old), server.wg_interface)
         if restore_old_cmd:
-            await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(restore_old_cmd)}"))
+            await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(restore_old_cmd)}"))
     return False
 
 
 async def _load_clients_table_strict(server_name: str) -> Optional[List[Dict]]:
-    raw = await _read_awg_file(server_name, "/opt/amnezia/awg/clientsTable")
+    server = _get_server(server_name)
+    if not server:
+        return None
+    raw = await _read_awg_file(server_name, f"{server.wg_base_dir}/clientsTable")
     if raw is None:
         return []
     if not raw.strip():
@@ -330,8 +385,11 @@ async def _load_clients_table_strict(server_name: str) -> Optional[List[Dict]]:
 
 
 async def _write_clients_table(server_name: str, table: List[Dict]) -> bool:
+    server = _get_server(server_name)
+    if not server:
+        return False
     payload = json.dumps(table, indent=4, ensure_ascii=False) + "\n"
-    return await _write_awg_file(server_name, "/opt/amnezia/awg/clientsTable", payload, mode="644")
+    return await _write_awg_file(server_name, f"{server.wg_base_dir}/clientsTable", payload, mode="644")
 
 # ─── Monitoring ───────────────────────────────────────────────────────────────
 
@@ -342,7 +400,7 @@ async def get_server_status(server_name: str) -> Dict:
     try:
         uptime_out, _, _ = await _exec(server_name, "uptime -p")
         load_out, _, _ = await _exec(server_name, "cat /proc/loadavg")
-        wg_out, _, code = await _exec(server_name, _docker("wg show"))
+        wg_out, _, code = await _exec(server_name, _docker(server_name, "wg show"))
         peers_count = wg_out.count("peer:")
         mem_out, _, _ = await _exec(server_name, "free -m | grep Mem")
         mem_parts = mem_out.split()
@@ -363,7 +421,10 @@ async def get_clients_table(server_name: str) -> List[Dict]:
     return table if table is not None else []
 
 async def get_wg_dump(server_name: str) -> Dict[str, Dict]:
-    out, _, _ = await _exec(server_name, _docker("wg show wg0 dump"))
+    server = _get_server(server_name)
+    if not server:
+        return {}
+    out, _, _ = await _exec(server_name, _docker(server_name, f"wg show {server.wg_interface} dump"))
     result = {}
     for line in out.splitlines()[1:]:
         parts = line.split("\t")
@@ -455,6 +516,7 @@ async def ping_server(server_name: str) -> Dict:
 async def _exec_in_context(server_name: str, cmd: str, context: str) -> Tuple[str, str, int]:
     if context == "vpn":
         wrapped = _docker(f"sh -lc {_sh_single_quote(cmd)}")
+        wrapped = _docker(server_name, f"sh -lc {_sh_single_quote(cmd)}")
         return await _exec(server_name, wrapped)
     return await _exec(server_name, cmd)
 
@@ -618,30 +680,37 @@ async def reboot_server(server_name: str) -> Dict:
 # ─── Peer management ──────────────────────────────────────────────────────────
 
 async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
-    priv_out, _, code = await _exec(server_name, _docker("wg genkey"))
+    server = _get_server(server_name)
+    if not server:
+        return None
+    conf_path = server.wg_config_path
+    base_dir = server.wg_base_dir
+    wg_iface = server.wg_interface
+
+    priv_out, _, code = await _exec(server_name, _docker(server_name, "wg genkey"))
     if code != 0 or not priv_out:
         return None
     privkey = priv_out.strip()
 
-    pub_out, _, code = await _exec(server_name, f"echo '{privkey}' | docker exec -i amnezia-awg wg pubkey")
+    pub_out, _, code = await _exec(server_name, f"echo '{privkey}' | {_docker(server_name, 'wg pubkey', stdin=True)}")
     if code != 0 or not pub_out:
         return None
     pubkey = pub_out.strip()
 
-    psk_out, _, _ = await _exec(server_name, _docker("wg genpsk"))
+    psk_out, _, _ = await _exec(server_name, _docker(server_name, "wg genpsk"))
     psk = psk_out.strip()
 
-    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    conf_out = await _read_awg_file(server_name, conf_path)
     if conf_out is None:
         return None
     used_ips = set(int(x) for x in re.findall(r"AllowedIPs\s*=\s*10\.8\.1\.(\d+)", conf_out))
     next_num = next(i for i in range(2, 255) if i not in used_ips)
     client_ip = f"10.8.1.{next_num}/32"
 
-    server_pub_out, _, _ = await _exec(server_name, _docker("cat /opt/amnezia/awg/wireguard_server_public_key.key"))
+    server_pub_out, _, _ = await _exec(server_name, _docker(server_name, f"cat {base_dir}/wireguard_server_public_key.key"))
     server_pubkey = server_pub_out.strip()
 
-    wg_show_out, _, _ = await _exec(server_name, _docker("wg show wg0"))
+    wg_show_out, _, _ = await _exec(server_name, _docker(server_name, f"wg show {wg_iface}"))
     awg_params = _extract_awg_params(wg_show_out, conf_out)
     port_match = re.search(r"listening port:\s*(\d+)", wg_show_out)
     port = port_match.group(1) if port_match else "46742"
@@ -650,15 +719,15 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
     if not await _validate_awg_conf_text(server_name, conf_new):
         return None
     await _backup_awg_conf(server_name)
-    if not await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_new, mode="600"):
+    if not await _write_awg_file(server_name, conf_path, conf_new, mode="600"):
         return None
 
-    awg_restore_cmd = _build_awg_restore_cmd(awg_params)
+    awg_restore_cmd = _build_awg_restore_cmd(awg_params, wg_iface)
 
     runtime_apply_cmd = (
         f"tmp_psk=$(mktemp) && "
         f"printf '%s' {_sh_single_quote(psk)} > \"$tmp_psk\" && "
-        f"wg set wg0 peer {pubkey} preshared-key \"$tmp_psk\" allowed-ips {client_ip}; "
+        f"wg set {wg_iface} peer {pubkey} preshared-key \"$tmp_psk\" allowed-ips {client_ip}; "
         f"rc=$?; "
         + (
             f"if [ $rc -eq 0 ] && ! ({awg_restore_cmd}); then rc=1; fi; "
@@ -666,11 +735,11 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
         )
         + f"rm -f \"$tmp_psk\"; exit $rc"
     )
-    _, _, apply_code = await _exec(server_name, _docker(f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
+    _, _, apply_code = await _exec(server_name, _docker(server_name, f"sh -lc {_sh_single_quote(runtime_apply_cmd)}"))
     if apply_code != 0:
         # If runtime apply failed, roll back config file.
-        await _exec(server_name, f"docker exec amnezia-awg wg set wg0 peer {pubkey} remove")
-        await _write_awg_file(server_name, "/opt/amnezia/awg/wg0.conf", conf_out, mode="600")
+        await _exec(server_name, _docker(server_name, f"wg set {wg_iface} peer {pubkey} remove"))
+        await _write_awg_file(server_name, conf_path, conf_out, mode="600")
         await _sync_wg_runtime_from_conf(server_name)
         return None
 
@@ -689,13 +758,12 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
         })
         await _write_clients_table(server_name, table)
 
-    server = _get_server(server_name)
-    amnezia_params = _awg_params_text(awg_params)
+    amnezia_params = _extract_awg_interface_extras(conf_out)
 
     client_config = (
         f"[Interface]\nPrivateKey = {privkey}\nAddress = {client_ip}\nDNS = 1.1.1.1\n"
-        f"{amnezia_params}\n"
-        f"[Peer]\nPublicKey = {server_pubkey}\nPresharedKey = {psk}\n"
+        + (f"{amnezia_params}\n" if amnezia_params else "")
+        + f"[Peer]\nPublicKey = {server_pubkey}\nPresharedKey = {psk}\n"
         f"Endpoint = {server.host}:{port}\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n"
     )
     return {"pubkey": pubkey, "privkey": privkey, "client_ip": client_ip,
@@ -703,7 +771,10 @@ async def add_peer(server_name: str, client_name: str) -> Optional[Dict]:
             "vpn_uri": _build_vpn_uri_from_config(client_config)}
 
 async def remove_peer(server_name: str, pubkey: str) -> bool:
-    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    server = _get_server(server_name)
+    if not server:
+        return False
+    conf_out = await _read_awg_file(server_name, server.wg_config_path)
     if conf_out is None:
         return False
     conf_new, removed = _remove_peer_from_conf_text(conf_out, pubkey)
@@ -719,7 +790,10 @@ async def remove_peer(server_name: str, pubkey: str) -> bool:
     return True
 
 async def disable_peer(server_name: str, pubkey: str) -> bool:
-    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    server = _get_server(server_name)
+    if not server:
+        return False
+    conf_out = await _read_awg_file(server_name, server.wg_config_path)
     if conf_out is None:
         return False
 
@@ -734,7 +808,10 @@ async def enable_peer(server_name: str, pubkey: str, client_ip: str) -> bool:
     if not client_ip:
         return False
 
-    conf_out = await _read_awg_file(server_name, "/opt/amnezia/awg/wg0.conf")
+    server = _get_server(server_name)
+    if not server:
+        return False
+    conf_out = await _read_awg_file(server_name, server.wg_config_path)
     if conf_out is None:
         return False
 
