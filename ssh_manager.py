@@ -533,7 +533,6 @@ async def ping_server(server_name: str) -> Dict:
 
 async def _exec_in_context(server_name: str, cmd: str, context: str) -> Tuple[str, str, int]:
     if context == "vpn":
-        wrapped = _docker(f"sh -lc {_sh_single_quote(cmd)}")
         wrapped = _docker(server_name, f"sh -lc {_sh_single_quote(cmd)}")
         return await _exec(server_name, wrapped)
     return await _exec(server_name, cmd)
