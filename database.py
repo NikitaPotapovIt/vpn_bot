@@ -655,12 +655,34 @@ async def sync_server_keys(server_name: str, peers: List[Dict]) -> Dict[str, int
 
         incoming = set()
         added = 0
+        legacy_server_name = None
+        if server_name.endswith(" AWG1"):
+            legacy_server_name = server_name[:-5].strip()
 
         for p in peers:
             pubkey = p.get("pubkey")
             if not pubkey:
                 continue
             incoming.add(pubkey)
+
+            # Migration safety: if server was renamed from "Name" to "Name AWG1",
+            # reuse existing legacy records instead of creating duplicates.
+            if pubkey not in existing and legacy_server_name:
+                cur = await db.execute(
+                    """
+                    UPDATE client_keys
+                    SET server_name = ?
+                    WHERE server_name = ? AND wg_pubkey = ?
+                      AND NOT EXISTS (
+                        SELECT 1 FROM client_keys ck2
+                        WHERE ck2.server_name = ? AND ck2.wg_pubkey = ?
+                      )
+                    """,
+                    (server_name, legacy_server_name, pubkey, server_name, pubkey),
+                )
+                if (cur.rowcount or 0) > 0:
+                    existing.add(pubkey)
+
             if pubkey not in existing:
                 added += 1
 
