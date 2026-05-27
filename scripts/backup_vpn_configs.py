@@ -54,8 +54,8 @@ async def _exec_on_server(server_name: str, command: str, is_local: bool) -> Tup
     return await ssh_exec(server_name, command)
 
 
-async def _read_container_file(server_name: str, is_local: bool, path: str) -> str:
-    cmd = f"docker exec amnezia-awg sh -lc {_single_quote(f'cat {path}')}"
+async def _read_container_file(server_name: str, is_local: bool, container_name: str, path: str) -> str:
+    cmd = f"docker exec {container_name} sh -lc {_single_quote(f'cat {path}')}"
     out, err, code = await _exec_on_server(server_name, cmd, is_local)
     if code != 0:
         raise RuntimeError(err or f"exit code {code}")
@@ -76,8 +76,9 @@ async def _backup_server(server) -> Path:
     backup_dir = server_dir / ts
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    wg_conf = await _read_container_file(server.name, server.is_local, "/opt/amnezia/awg/wg0.conf")
-    clients_table = await _read_container_file(server.name, server.is_local, "/opt/amnezia/awg/clientsTable")
+    base_dir = getattr(server, "wg_base_dir", "/opt/amnezia/awg")
+    wg_conf = await _read_container_file(server.name, server.is_local, server.vpn_container, server.wg_config_path)
+    clients_table = await _read_container_file(server.name, server.is_local, server.vpn_container, f"{base_dir}/clientsTable")
 
     (backup_dir / "wg0.conf").write_text((wg_conf or "") + "\n", encoding="utf-8")
     (backup_dir / "clientsTable.json").write_text((clients_table or "") + "\n", encoding="utf-8")

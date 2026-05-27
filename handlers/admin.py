@@ -94,6 +94,7 @@ SUPPORT_CLOSE_TEXTS = {"❌ Закрыть диалог", "❌ Close dialog"}
 HOME_MENU_TEXTS = {"🏠 Главное меню", "🏠 Main Menu"}
 BACK_TEXTS = {"◀️ Назад", "◀️ Back"}
 LANG_BUTTON_TEXTS = {"🌐 Язык", "🌐 Language"}
+SERVER_PROTOCOL = {s.name: (s.protocol_label or "AWG1") for s in SERVERS}
 
 
 async def _lang_for_user(user) -> str:
@@ -110,6 +111,10 @@ async def _lang_for_user(user) -> str:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def _server_proto(server_name: str) -> str:
+    return SERVER_PROTOCOL.get(server_name, "AWG1")
 
 
 def admin_main_kb(lang: str = "ru") -> ReplyKeyboardMarkup:
@@ -887,6 +892,7 @@ async def support_set_client(cb: CallbackQuery):
 async def support_set_broadcast(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
         return
+    lang = await _lang_for_user(cb.from_user)
     set_admin_target(cb.from_user.id, SUPPORT_BROADCAST_TARGET)
     await cb.message.edit_text(
         (
@@ -1101,7 +1107,7 @@ async def show_unlinked_info(cb: CallbackQuery):
         online = "🟢" if k.connected else "🔴"
         payer = "💰" if k.payer else "🚫"
         lines.append(
-            f"{online}{payer} <b>{k.key_name or ('No name' if lang == 'en' else 'Без имени')}</b> | {k.server_name} | {k.allowed_ips or '—'}"
+            f"{online}{payer}[{_server_proto(k.server_name)}] <b>{k.key_name or ('No name' if lang == 'en' else 'Без имени')}</b> | {k.server_name} | {k.allowed_ips or '—'}"
         )
 
     if len(keys) > 20:
@@ -1110,7 +1116,7 @@ async def show_unlinked_info(cb: CallbackQuery):
     rows = [[InlineKeyboardButton(text=("➕ Create client (manual)" if lang == "en" else "➕ Создать клиента (вручную)"), callback_data="add_client_inline")]]
     for k in keys[:10]:
         online = "🟢" if k.connected else "🔴"
-        label = f"{online}➕ {k.key_name or k.wg_pubkey[:8]} | {k.server_name}"
+        label = f"{online}➕[{_server_proto(k.server_name)}] {k.key_name or k.wg_pubkey[:8]} | {k.server_name}"
         rows.append([InlineKeyboardButton(text=label[:60], callback_data=f"create_from_key:{k.id}")])
     rows.append([InlineKeyboardButton(text=("◀️ To clients" if lang == "en" else "◀️ К клиентам"), callback_data="back_to_clients")])
 
@@ -1260,7 +1266,7 @@ async def client_keys(cb: CallbackQuery):
     for key in keys:
         state = "🟢" if key.connected else "🔴"
         payer = "💰" if key.payer else "🚫"
-        label = f"{state}{payer} {key.key_name or key.wg_pubkey[:8]}"
+        label = f"{state}{payer}[{_server_proto(key.server_name)}] {key.key_name or key.wg_pubkey[:8]}"
         rows.append([
             InlineKeyboardButton(text=label[:60], callback_data=f"key_card:{key.id}:{client_id}")
         ])
@@ -1285,7 +1291,7 @@ async def create_key_pick_server(cb: CallbackQuery):
         return
 
     rows = [
-        [InlineKeyboardButton(text=f"🖥 {s.name}", callback_data=f"create_key_do:{client_id}:{s.name}")]
+        [InlineKeyboardButton(text=f"🖥 {s.name} [{s.protocol_label}]", callback_data=f"create_key_do:{client_id}:{s.name}")]
         for s in SERVERS
     ]
     rows.append([InlineKeyboardButton(text="◀️ To keys" if lang == "en" else "◀️ К ключам", callback_data=f"client_keys:{client_id}")])
@@ -1355,7 +1361,7 @@ async def create_key_do(cb: CallbackQuery):
         caption=(
             (f"🔑 New key for <b>{client.name}</b>\n" if lang == "en" else f"🔑 Новый ключ для <b>{client.name}</b>\n")
             + (f"Key name: <b>{peer_name}</b>\n" if lang == "en" else f"Название ключа: <b>{peer_name}</b>\n")
-            + (f"Server: {server_name}\n")
+            + (f"Server: {server_name} [{_server_proto(server_name)}]\n")
             +
             f"IP: {wg_data['client_ip']}"
         ),
@@ -1393,7 +1399,7 @@ async def create_key_do(cb: CallbackQuery):
         (
             ("✅ Key created.\n" if lang == "en" else "✅ Ключ создан.\n")
             + (f"Name: <b>{peer_name}</b>\n" if lang == "en" else f"Название: <b>{peer_name}</b>\n")
-            + f"Server: <b>{server_name}</b>\n"
+            + f"Server: <b>{server_name} [{_server_proto(server_name)}]</b>\n"
             f"IP: <b>{wg_data['client_ip']}</b>\n\n"
             + (f"vpn:// delivery to client: <b>{vpn_delivery_text}</b>" if lang == "en" else f"Отправка vpn:// клиенту: <b>{vpn_delivery_text}</b>")
         ),
@@ -1437,7 +1443,7 @@ async def _show_key_card(cb: CallbackQuery, key_id: int, client_id: int):
     text = (
         (f"<b>🔑 Key</b>\n" if lang == "en" else f"<b>🔑 Ключ</b>\n")
         + (f"Name: <b>{key.key_name or 'No name'}</b>\n" if lang == "en" else f"Имя: <b>{key.key_name or 'Без имени'}</b>\n")
-        + f"Server: {key.server_name}\n"
+        + f"Server: {key.server_name} [{_server_proto(key.server_name)}]\n"
         +
         f"IP: {key.allowed_ips or '—'}\n"
         + (f"Status: {conn_text}\n" if lang == "en" else f"Статус: {conn_text}\n")

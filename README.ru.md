@@ -32,7 +32,7 @@ Telegram-бот для управления VPN-клиентами (WireGuard/Am
 
 - Python 3.10+
 - Linux-сервер (для systemd/cron)
-- Docker на VPN-серверах (контейнер `amnezia-awg`)
+- Docker на VPN-серверах (контейнеры `amnezia-awg` и/или `amnezia-awg2`)
 - Доступ по SSH к VPN-серверам
 
 ## Быстрый старт
@@ -69,7 +69,7 @@ python bot.py
 
 Предпочтительный формат:
 
-- `SERVER_1_NAME`, `SERVER_1_HOST`, `SERVER_1_PORT`, `SERVER_1_SSH_USER`, `SERVER_1_SSH_KEY_PATH`, `SERVER_1_WG_INTERFACE`, `SERVER_1_WG_CONFIG_PATH`, `SERVER_1_IS_LOCAL`
+- `SERVER_1_NAME`, `SERVER_1_HOST`, `SERVER_1_PORT`, `SERVER_1_SSH_USER`, `SERVER_1_SSH_KEY_PATH`, `SERVER_1_WG_INTERFACE`, `SERVER_1_WG_CONFIG_PATH`, `SERVER_1_VPN_CONTAINER`, `SERVER_1_PROTOCOL_LABEL`, `SERVER_1_IS_LOCAL`
 - `SERVER_2_*`, `SERVER_3_*` и т.д.
 
 Поддерживается и legacy-формат (`FRANCE_HOST`, `GERMANY_HOST`, `ICELAND_HOST`, `JAPAN_HOST`) для обратной совместимости.

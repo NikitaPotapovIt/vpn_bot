@@ -32,7 +32,7 @@ A Telegram bot for managing VPN clients (WireGuard/AmneziaWG): client onboarding
 
 - Python 3.10+
 - Linux server (for systemd/cron)
-- Docker on VPN hosts (container `amnezia-awg`)
+- Docker on VPN hosts (containers `amnezia-awg` and/or `amnezia-awg2`)
 - SSH access to VPN hosts
 
 ## Quick Start
@@ -69,7 +69,7 @@ python bot.py
 
 Preferred format:
 
-- `SERVER_1_NAME`, `SERVER_1_HOST`, `SERVER_1_PORT`, `SERVER_1_SSH_USER`, `SERVER_1_SSH_KEY_PATH`, `SERVER_1_WG_INTERFACE`, `SERVER_1_WG_CONFIG_PATH`, `SERVER_1_IS_LOCAL`
+- `SERVER_1_NAME`, `SERVER_1_HOST`, `SERVER_1_PORT`, `SERVER_1_SSH_USER`, `SERVER_1_SSH_KEY_PATH`, `SERVER_1_WG_INTERFACE`, `SERVER_1_WG_CONFIG_PATH`, `SERVER_1_VPN_CONTAINER`, `SERVER_1_PROTOCOL_LABEL`, `SERVER_1_IS_LOCAL`
 - then `SERVER_2_*`, `SERVER_3_*`, etc.
 
 Legacy variables (`FRANCE_HOST`, `GERMANY_HOST`, `ICELAND_HOST`, `JAPAN_HOST`) are still supported for backward compatibility.

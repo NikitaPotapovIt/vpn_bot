@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import List, Optional
 from dotenv import load_dotenv
 load_dotenv()
@@ -35,7 +36,13 @@ class ServerConfig:
     ssh_key_path: str
     wg_interface: str = "wg0"
     wg_config_path: str = "/opt/amnezia/awg/wg0.conf"
+    vpn_container: str = "amnezia-awg"
+    protocol_label: str = "AWG1"
     is_local: bool = False
+
+    @property
+    def wg_base_dir(self) -> str:
+        return str(PurePosixPath(self.wg_config_path).parent)
 
 def _build_server_from_index(index: int, default_ssh_key: str) -> Optional[ServerConfig]:
     prefix = f"SERVER_{index}_"
@@ -51,6 +58,8 @@ def _build_server_from_index(index: int, default_ssh_key: str) -> Optional[Serve
         ssh_key_path=os.getenv(f"{prefix}SSH_KEY_PATH", default_ssh_key),
         wg_interface=os.getenv(f"{prefix}WG_INTERFACE", "wg0"),
         wg_config_path=os.getenv(f"{prefix}WG_CONFIG_PATH", "/opt/amnezia/awg/wg0.conf"),
+        vpn_container=os.getenv(f"{prefix}VPN_CONTAINER", "amnezia-awg"),
+        protocol_label=(os.getenv(f"{prefix}PROTOCOL_LABEL", "AWG1") or "AWG1").strip().upper(),
         is_local=_as_bool(os.getenv(f"{prefix}IS_LOCAL"), False),
     )
 
@@ -65,6 +74,8 @@ def _build_server_legacy(name: str, host_key: str, default_ssh_key: str, is_loca
         port=22,
         ssh_user="root",
         ssh_key_path=default_ssh_key,
+        vpn_container="amnezia-awg",
+        protocol_label="AWG1",
         is_local=is_local,
     )
 
