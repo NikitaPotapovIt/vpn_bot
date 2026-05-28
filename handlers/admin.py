@@ -1935,9 +1935,15 @@ async def do_ping(cb: CallbackQuery):
     server_name = cb.data.split(":", 1)[1]
     await cb.message.edit_text(f"⏳ {'Pinging' if lang == 'en' else 'Пингую'} {server_name}...")
     result = await ping_server(server_name)
-    if result["success"] and result["ms"]:
+    if result["success"] and result["ms"] is not None:
         emoji = "🟢" if result["ms"] < 50 else ("🟡" if result["ms"] < 150 else "🔴")
         text = f"{emoji} <b>{server_name}</b>\n{'Ping' if lang == 'en' else 'Пинг'}: <b>{result['ms']:.1f} ms</b>"
+    elif result["success"]:
+        text = (
+            f"🟢 <b>{server_name}</b>\nTCP/22: <b>OK</b> (ICMP blocked)"
+            if lang == "en"
+            else f"🟢 <b>{server_name}</b>\nTCP/22: <b>OK</b> (ICMP закрыт)"
+        )
     else:
         text = f"❌ <b>{server_name}</b> {'is not responding' if lang == 'en' else 'не отвечает'}"
     await cb.message.edit_text(
@@ -1956,9 +1962,13 @@ async def ping_all(cb: CallbackQuery):
     lines = ["<b>📶 Server ping:</b>", ""] if lang == "en" else ["<b>📶 Пинг серверов:</b>", ""]
     for s in SERVERS:
         result = await ping_server(s.name)
-        if result["success"] and result["ms"]:
+        if result["success"] and result["ms"] is not None:
             emoji = "🟢" if result["ms"] < 50 else ("🟡" if result["ms"] < 150 else "🔴")
             lines.append(f"{emoji} {s.name}: <b>{result['ms']:.1f} ms</b>")
+        elif result["success"]:
+            lines.append(
+                f"🟢 {s.name}: <b>TCP/22 OK</b> {'(ICMP blocked)' if lang == 'en' else '(ICMP закрыт)'}"
+            )
         else:
             lines.append(f"❌ {s.name}: {'unavailable' if lang == 'en' else 'недоступен'}")
     await cb.message.edit_text(
@@ -1973,16 +1983,25 @@ async def ping_all(cb: CallbackQuery):
 
 def _format_speed_result(server_name: str, result: dict, label: str, lang: str = "ru") -> str:
     if result.get("success"):
-        dl = result.get("download_mbps", "—")
-        ul = result.get("upload_mbps", "—")
-        ping = result.get("ping_ms", "—")
+        dl = result.get("download_mbps")
+        ul = result.get("upload_mbps")
+        ping = result.get("ping_ms")
         method = result.get("method", "")
+        dl_text = f"{float(dl):.1f} Mbit/s" if isinstance(dl, (int, float)) else "—"
+        ul_text = f"{float(ul):.1f} Mbit/s" if isinstance(ul, (int, float)) else "—"
+        ping_text = f"{float(ping):.1f} ms" if isinstance(ping, (int, float)) else "—"
+        lines = [
+            f"{label} <b>{server_name}</b>",
+            f"⬇️ Download: <b>{dl_text}</b>",
+        ]
+        if isinstance(ul, (int, float)):
+            lines.append(f"⬆️ Upload: <b>{ul_text}</b>")
+        if isinstance(ping, (int, float)):
+            lines.append(f"📶 Ping: {ping_text}")
+        if method:
+            lines.append(f"<i>{'method' if lang == 'en' else 'метод'}: {method}</i>")
         return (
-            f"{label} <b>{server_name}</b>\n"
-            f"⬇️ Download: <b>{dl} Mbit/s</b>\n"
-            f"⬆️ Upload: <b>{ul} Mbit/s</b>\n"
-            f"📶 Ping: {ping} ms\n"
-            f"<i>{'method' if lang == 'en' else 'метод'}: {method}</i>"
+            "\n".join(lines)
         )
     diag = result.get("diagnostic")
     diag_line = f"\n<i>{diag}</i>" if diag else ""
@@ -2050,9 +2069,17 @@ async def speed_all_host(cb: CallbackQuery):
     for s in SERVERS:
         result = await speed_test_host(s.name)
         if result.get("success"):
-            dl = result.get("download_mbps", "—")
-            ul = result.get("upload_mbps", "—")
-            lines.append(f"✅ {s.name}: ⬇️ <b>{dl}</b> ⬆️ <b>{ul}</b> Mbit/s")
+            dl = result.get("download_mbps")
+            ul = result.get("upload_mbps")
+            method = result.get("method", "")
+            dl_text = f"{float(dl):.1f}" if isinstance(dl, (int, float)) else "—"
+            if isinstance(ul, (int, float)):
+                ul_text = f"{float(ul):.1f}"
+                lines.append(f"✅ {s.name}: ⬇️ <b>{dl_text}</b> ⬆️ <b>{ul_text}</b> Mbit/s")
+            else:
+                lines.append(f"✅ {s.name}: ⬇️ <b>{dl_text}</b> Mbit/s")
+            if method:
+                lines.append(f"<i>{'method' if lang == 'en' else 'метод'}: {method}</i>")
         else:
             lines.append(f"❌ {s.name}: {result.get('error', 'error' if lang == 'en' else 'ошибка')}")
     await cb.message.edit_text(
@@ -2072,9 +2099,17 @@ async def speed_all_vpn(cb: CallbackQuery):
     for s in SERVERS:
         result = await speed_test_vpn(s.name)
         if result.get("success"):
-            dl = result.get("download_mbps", "—")
-            ul = result.get("upload_mbps", "—")
-            lines.append(f"✅ {s.name}: ⬇️ <b>{dl}</b> ⬆️ <b>{ul}</b> Mbit/s")
+            dl = result.get("download_mbps")
+            ul = result.get("upload_mbps")
+            method = result.get("method", "")
+            dl_text = f"{float(dl):.1f}" if isinstance(dl, (int, float)) else "—"
+            if isinstance(ul, (int, float)):
+                ul_text = f"{float(ul):.1f}"
+                lines.append(f"✅ {s.name}: ⬇️ <b>{dl_text}</b> ⬆️ <b>{ul_text}</b> Mbit/s")
+            else:
+                lines.append(f"✅ {s.name}: ⬇️ <b>{dl_text}</b> Mbit/s")
+            if method:
+                lines.append(f"<i>{'method' if lang == 'en' else 'метод'}: {method}</i>")
         else:
             lines.append(f"❌ {s.name}: {result.get('error', 'error' if lang == 'en' else 'ошибка')}")
     await cb.message.edit_text(

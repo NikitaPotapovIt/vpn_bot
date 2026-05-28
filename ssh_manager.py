@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import re
+import socket
 import time
 import zlib
 from typing import Optional, Dict, List, Tuple
@@ -529,7 +530,28 @@ async def ping_server(server_name: str) -> Dict:
     out, _, code = await local_exec(f"ping -c 3 -W 3 {server.host}")
     match = re.search(r"min/avg/max.*?=\s+[\d.]+/([\d.]+)/", out)
     avg_ms = float(match.group(1)) if match else None
-    return {"success": code == 0, "ms": avg_ms, "host": server.host, "name": server_name}
+    if code == 0:
+        return {"success": True, "ms": avg_ms, "host": server.host, "name": server_name}
+
+    # ICMP can be blocked by firewall while SSH remains reachable.
+    def _tcp_probe(host: str, port: int, timeout: float = 3.0) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    loop = asyncio.get_event_loop()
+    tcp_ok = await loop.run_in_executor(None, _tcp_probe, server.host, server.port, 3.0)
+    if tcp_ok:
+        return {
+            "success": True,
+            "ms": None,
+            "host": server.host,
+            "name": server_name,
+            "note": "icmp_blocked_tcp_ok",
+        }
+    return {"success": False, "ms": avg_ms, "host": server.host, "name": server_name}
 
 async def _exec_in_context(server_name: str, cmd: str, context: str) -> Tuple[str, str, int]:
     if context == "vpn":
