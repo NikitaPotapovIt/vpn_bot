@@ -3013,6 +3013,3 @@ async def support_send_from_admin(msg: Message, state: FSMContext):
         parse_mode="HTML",
         reply_markup=_admin_support_dialog_kb(lang),
     )
-    lang = await _lang_for_user(cb.from_user)
-    lang = await _lang_for_user(cb.from_user)
-    lang = await _lang_for_user(cb.from_user)
